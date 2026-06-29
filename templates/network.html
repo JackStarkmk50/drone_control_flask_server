@@ -1,0 +1,235 @@
+<!-- Save as templates/network.html -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport"
+      content="width=device-width,
+               initial-scale=1">
+<title>Network Settings</title>
+<style>
+* { box-sizing: border-box;
+    margin: 0; padding: 0; }
+body {
+    font-family: sans-serif;
+    background: #111;
+    color: #eee;
+    padding: 15px;
+}
+h1 { color: #0f0;
+     font-size: 18px;
+     margin-bottom: 15px; }
+h2 { color: #0af;
+     font-size: 15px;
+     margin: 12px 0 8px; }
+.card {
+    background: #1a1a1a;
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 12px;
+}
+input {
+    width: 100%;
+    padding: 8px;
+    background: #222;
+    border: 1px solid #444;
+    color: #fff;
+    border-radius: 4px;
+    font-size: 14px;
+    margin-bottom: 8px;
+}
+.btn {
+    width: 100%;
+    padding: 10px;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    margin-bottom: 8px;
+}
+.btn-scan {
+    background: #333;
+    color: #0f0;
+}
+.btn-connect {
+    background: #005a9e;
+    color: #fff;
+}
+.network-item {
+    padding: 8px;
+    background: #222;
+    border-radius: 4px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    font-size: 13px;
+}
+.network-item:active {
+    background: #333;
+}
+.nav {
+    margin-bottom: 12px;
+}
+.nav a {
+    color: #0af;
+    font-size: 13px;
+    margin-right: 12px;
+    text-decoration: none;
+}
+.hotspot-info {
+    background: #1a3a1a;
+    border: 1px solid #0a0;
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    line-height: 1.8;
+}
+</style>
+</head>
+<body>
+
+<h1>📡 Network Settings</h1>
+
+<div class="nav">
+    <a href="/">← Back to Tuner</a>
+</div>
+
+<div class="hotspot-info">
+    <strong>Current Hotspot:</strong><br>
+    SSID: DroneControl<br>
+    Password: drone1234<br>
+    Pi IP: 192.168.4.1
+</div>
+
+<div class="card">
+    <h2>Connect Pi to WiFi</h2>
+    <p style="font-size:12px;
+              color:#888;
+              margin-bottom:8px">
+        Connect Pi to internet for
+        remote access via ngrok
+    </p>
+    <button class="btn btn-scan"
+            onclick="scanNetworks()">
+        🔍 Scan Networks
+    </button>
+    <div id="networks"></div>
+
+    <input type="text"
+           id="ssid"
+           placeholder="WiFi Name (SSID)">
+    <input type="password"
+           id="password"
+           placeholder="WiFi Password">
+    <button class="btn btn-connect"
+            onclick="connectWifi()">
+        Connect to WiFi
+    </button>
+    <div id="wifi-status"
+         style="font-size:13px;
+                color:#0f0;
+                margin-top:8px">
+    </div>
+</div>
+
+<script>
+async function scanNetworks() {
+    document.getElementById('networks')
+        .innerHTML =
+        '<p style="color:#888;'+
+        'font-size:13px">Scanning...</p>';
+
+    try {
+        const r = await fetch(
+            '/network/scan');
+        const data = await r.json();
+
+        if (!data.networks ||
+            !data.networks.length) {
+            document
+                .getElementById('networks')
+                .innerHTML =
+                '<p style="color:#888;'+
+                'font-size:13px">'+
+                'No networks found</p>';
+            return;
+        }
+
+        let html = '';
+        data.networks.forEach(n => {
+            html += `
+<div class="network-item"
+     onclick="selectNetwork('${n.ssid}')">
+    📶 ${n.ssid}
+    ${n.signal ?
+      '<span style="color:#888;'+
+      'float:right">'+n.signal+'</span>'
+      : ''}
+</div>`;
+        });
+        document
+            .getElementById('networks')
+            .innerHTML = html;
+    } catch(e) {
+        document
+            .getElementById('networks')
+            .innerHTML =
+            '<p style="color:#f00;'+
+            'font-size:13px">Scan failed</p>';
+    }
+}
+
+function selectNetwork(ssid) {
+    document.getElementById('ssid')
+        .value = ssid;
+    document.getElementById('password')
+        .focus();
+}
+
+async function connectWifi() {
+    const ssid = document
+        .getElementById('ssid').value;
+    const password = document
+        .getElementById('password').value;
+
+    if (!ssid) {
+        alert('Enter WiFi name');
+        return;
+    }
+
+    const status = document
+        .getElementById('wifi-status');
+    status.textContent = 'Connecting...';
+    status.style.color = '#fa0';
+
+    try {
+        const r = await fetch(
+            '/network/connect', {
+            method: 'POST',
+            headers: {
+                'Content-Type':
+                    'application/json'
+            },
+            body: JSON.stringify({
+                ssid, password
+            })
+        });
+        const data = await r.json();
+        if (data.success) {
+            status.textContent =
+                `✅ ${data.message}`;
+            status.style.color = '#0f0';
+        } else {
+            status.textContent =
+                `❌ ${data.message}`;
+            status.style.color = '#f00';
+        }
+    } catch(e) {
+        status.textContent =
+            '❌ Connection failed';
+        status.style.color = '#f00';
+    }
+}
+</script>
+</body>
+</html>

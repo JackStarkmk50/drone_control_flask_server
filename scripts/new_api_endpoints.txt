@@ -1,0 +1,100 @@
+## All Endpoints Summary
+```
+GET  /status
+→ Returns all drone data
+
+POST /arm
+→ Arms the drone
+
+POST /disarm
+→ Disarms the drone
+
+POST /safety
+→ body: {"state": "on"} or {"state": "off"}
+
+POST /takeoff
+→ body: {"altitude": 3}
+→ altitude = any value 0.5 to 10m
+→ not permanent, just for this flight
+
+POST /land
+→ Switches to LAND mode
+
+POST /rtl
+→ Returns to launch (needs GPS)
+
+POST /hold
+→ Loiter if GPS, AltHold if not
+
+POST /move
+→ body: {
+    "direction": "forward",
+    "distance": 2,
+    "speed": 0.5
+  }
+→ directions: forward/backward/
+              left/right/up/down
+
+POST /yaw
+→ body: {
+    "direction": "right",
+    "degrees": 90,
+    "speed": 30
+  }
+→ direction: left or right
+→ degrees: 1 to 360
+→ speed: degrees per second
+
+POST /mode
+→ body: {"mode": "LOITER"}
+→ modes: STABILIZE/ALTHOLD/
+         LOITER/GUIDED/LAND/RTL
+
+GET  /param?name=ARMING_CHECK
+→ Returns param value
+
+POST /param
+→ body: {"param": "ARMING_CHECK", "value": 0}
+→ Sets param value
+
+POST /emergency
+→ Immediate land and disarm
+```
+
+---
+
+## About Takeoff Altitude
+```
+Your question about permanent vs temporary:
+
+altitude in /takeoff endpoint:
+→ NOT permanent
+→ Only for that specific takeoff
+→ Each call can have different value
+→ Next takeoff can be different height
+
+If you want permanent default:
+→ Set via /param endpoint
+→ TKOFF_ALT parameter
+→ But better to pass each time
+   in the request body
+```
+
+---
+
+## About Safety Switch
+```
+Physical safety button on Pixhawk:
+→ Must be pressed before arming
+→ Prevents accidental arm
+
+If you don't have physical button:
+→ Set in Mission Planner:
+  BRD_SAFETYENABLE = 0
+→ Disables safety requirement
+→ Then /arm works directly
+→ No need for /safety endpoint
+
+Recommended:
+BRD_SAFETYENABLE = 0
+for autonomous Pi control

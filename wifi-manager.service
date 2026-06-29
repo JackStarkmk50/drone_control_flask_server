@@ -1,0 +1,20 @@
+# wifi-manager.service
+# Copy to: /etc/systemd/system/wifi-manager.service
+# Then run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable wifi-manager.service
+
+[Unit]
+Description=WiFi Client with Hotspot Fallback
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/pi/wifi_manager.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

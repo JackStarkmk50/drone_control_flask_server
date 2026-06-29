@@ -1,0 +1,27 @@
+# drone-api.service
+# Copy to: /etc/systemd/system/drone-api.service
+# Then run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable drone-api.service
+#
+# Adjust paths below if your project folder or venv name differs:
+#   WorkingDirectory = folder containing /scripts/new_api_server_1.py
+#   ExecStart        = path to python inside your venv
+
+[Unit]
+Description=Drone API Server (Flask + DroneKit)
+After=wifi-manager.service network.target
+Wants=wifi-manager.service
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/drone
+Environment=PATH=/home/pi/drone/venv/bin
+ExecStart=/home/pi/drone/venv/bin/python3 /home/pi/drone/scripts/new_api_server_1.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

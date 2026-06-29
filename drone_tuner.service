@@ -1,0 +1,20 @@
+# Save as drone_tuner.service
+# Run: sudo cp drone_tuner.service
+#      /etc/systemd/system/
+# Then: sudo systemctl enable drone_tuner
+# Then: sudo systemctl start drone_tuner
+
+[Unit]
+Description=Drone PID Tuner
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/drone_project
+Environment=PATH=/home/pi/drone_project/drone_env/bin
+ExecStart=/home/pi/drone_project/drone_env/bin/python3 /home/pi/drone_project/scripts/pid_tuner.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

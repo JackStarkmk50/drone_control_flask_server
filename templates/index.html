@@ -1,0 +1,256 @@
+<!-- Save as templates/index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Drone Control</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js">
+    </script>
+    <style>
+        * { margin: 0; padding: 0;
+            box-sizing: border-box; }
+        body {
+            font-family: monospace;
+            background: #111;
+            color: #0f0;
+            padding: 20px;
+        }
+        h2 { margin-bottom: 15px;
+             color: #fff; }
+        #status {
+            padding: 8px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        .connected {
+            background: #0a3a0a;
+            color: #0f0;
+        }
+        .disconnected {
+            background: #3a0a0a;
+            color: #f00;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns:
+                repeat(auto-fit,
+                minmax(150px, 1fr));
+            gap: 12px;
+        }
+        .card {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .label {
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 6px;
+        }
+        .value {
+            font-size: 22px;
+            font-weight: bold;
+            color: #0f0;
+        }
+        .armed { color: #f00; }
+        .disarmed { color: #0f0; }
+        .warn { color: #fa0; }
+    </style>
+</head>
+<body>
+    <h2>🚁 Drone Telemetry</h2>
+
+    <div id="status" class="disconnected">
+        ❌ Connecting...
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="label">MODE</div>
+            <div class="value"
+                 id="mode">--</div>
+        </div>
+        <div class="card">
+            <div class="label">ARMED</div>
+            <div class="value"
+                 id="armed">--</div>
+        </div>
+        <div class="card">
+            <div class="label">
+                ALTITUDE (m)
+            </div>
+            <div class="value"
+                 id="altitude">--</div>
+        </div>
+        <div class="card">
+            <div class="label">
+                BATTERY (V)
+            </div>
+            <div class="value"
+                 id="battery">--</div>
+        </div>
+        <div class="card">
+            <div class="label">
+                SATELLITES
+            </div>
+            <div class="value"
+                 id="satellites">--</div>
+        </div>
+        <div class="card">
+            <div class="label">GPS FIX</div>
+            <div class="value"
+                 id="gps_fix">--</div>
+        </div>
+        <div class="card">
+            <div class="label">PITCH</div>
+            <div class="value"
+                 id="pitch">--</div>
+        </div>
+        <div class="card">
+            <div class="label">ROLL</div>
+            <div class="value"
+                 id="roll">--</div>
+        </div>
+        <div class="card">
+            <div class="label">YAW</div>
+            <div class="value"
+                 id="yaw">--</div>
+        </div>
+	<div class="card">
+            <div class="label">VIBE X</div>
+            <div class="value"
+                 id="vibex">--</div>
+        </div>
+        <div class="card">
+            <div class="label">VIBE Y</div>
+            <div class="value"
+                 id="vibey">--</div>
+        </div>
+        <div class="card">
+            <div class="label">VIBE Z</div>
+            <div class="value"
+                 id="vibez">--</div>
+        </div>        
+	<div class="card">
+            <div class="label">
+                GROUNDSPEED
+            </div>
+            <div class="value"
+                 id="groundspeed">--</div>
+        </div>
+        <div class="card">
+            <div class="label">
+                LATITUDE
+            </div>
+            <div class="value"
+                 id="lat">--</div>
+        </div>
+        <div class="card">
+            <div class="label">
+                LONGITUDE
+            </div>
+            <div class="value"
+                 id="lon">--</div>
+        </div>
+    </div>
+
+    <script>
+        // Connect to SAME server
+        // No URL needed = auto connects
+	let yawDeg = 0;
+        const socket = io();
+
+        socket.on('connect', () => {
+            const s = document
+                .getElementById('status');
+            s.textContent =
+                '✅ Connected to drone';
+            s.className =
+                'connected';
+        });
+
+        socket.on('disconnect', () => {
+            const s = document
+                .getElementById('status');
+            s.textContent =
+                '❌ Disconnected';
+            s.className =
+                'disconnected';
+        });
+
+        socket.on('telemetry', (data) => {
+
+            document.getElementById('mode')
+                .textContent = data.mode;
+
+            const armedEl = document
+                .getElementById('armed');
+            armedEl.textContent =
+                data.armed ? 'ARMED' : 'SAFE';
+            armedEl.className =
+                'value ' +
+                (data.armed ?
+                 'armed' : 'disarmed');
+
+            document.getElementById('altitude')
+                .textContent =
+                data.altitude;
+
+            const batEl = document
+                .getElementById('battery');
+            batEl.textContent =
+                data.battery.toFixed(1);
+            batEl.className =
+                'value ' +
+                (data.battery < 11.0 ?
+                 'armed' : 'disarmed');
+
+            document.getElementById('satellites')
+                .textContent =
+                data.satellites;
+
+            document.getElementById('gps_fix')
+                .textContent =
+                data.gps_fix >= 3 ?
+                '3D Fix ✅' : 'No Fix ❌';
+
+            document.getElementById('pitch')
+                .textContent =
+                (data.pitch * (180 / Math.PI)).toFixed(2);
+
+            document.getElementById('roll')
+                .textContent =
+                (data.roll * (180 / Math.PI)).toFixed(2);
+	    
+	    yawDeg = data.yaw * (180 / Math.PI)
+	    yawDeg = yawDeg < 0 ? yawDeg + 360 : yawDeg;
+            document.getElementById('yaw')
+                .textContent = 
+		yawDeg.toFixed(2);
+	     	
+            document.getElementById('vibex')
+                .textContent = data.vibe_x !== undefined ? data.vibe_x.toFixed(3) : '--';
+            document.getElementById('vibey')
+                .textContent = data.vibe_y !== undefined ? data.vibe_y.toFixed(3) : '--';
+            document.getElementById('vibez')
+                .textContent = data.vibe_z !== undefined ? data.vibe_z.toFixed(3) : '--';
+
+            document.getElementById('groundspeed')
+                .textContent =
+                data.groundspeed.toFixed(1)
+                + ' m/s';
+
+            document.getElementById('lat')
+                .textContent =
+                data.lat ?
+                data.lat.toFixed(6) : '--';
+
+            document.getElementById('lon')
+                .textContent =
+                data.lon ?
+                data.lon.toFixed(6) : '--';
+        });
+    </script>
+</body>
+</html>

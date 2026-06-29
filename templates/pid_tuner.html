@@ -1,0 +1,511 @@
+<!-- Save as templates/pid_tuner.html -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport"
+      content="width=device-width,
+               initial-scale=1">
+<title>PID Tuner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+<style>
+* { box-sizing: border-box;
+    margin: 0; padding: 0; }
+body {
+    font-family: sans-serif;
+    background: #111;
+    color: #eee;
+    padding: 10px;
+}
+h1 { color: #0f0;
+     font-size: 18px;
+     margin-bottom: 10px; }
+h2 { color: #0af;
+     font-size: 15px;
+     margin: 10px 0 6px; }
+
+/* Telemetry bar */
+.telem {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+    background: #1a1a1a;
+    padding: 8px;
+    border-radius: 8px;
+}
+.telem-item {
+    font-size: 12px;
+    background: #222;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+.telem-item span {
+    color: #0f0;
+    font-weight: bold;
+}
+
+/* Tabs */
+.tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 12px;
+}
+.tab {
+    padding: 6px 12px;
+    background: #222;
+    border: 1px solid #444;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #aaa;
+}
+.tab.active {
+    background: #0af;
+    color: #000;
+    border-color: #0af;
+}
+
+/* Groups */
+.group { display: none; }
+.group.active { display: block; }
+
+/* Param rows */
+.param-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    background: #1a1a1a;
+    padding: 8px;
+    border-radius: 6px;
+}
+.param-label {
+    flex: 1;
+    font-size: 13px;
+    color: #aaa;
+}
+.param-name {
+    font-size: 10px;
+    color: #666;
+}
+.param-input {
+    width: 90px;
+    padding: 6px;
+    background: #222;
+    border: 1px solid #444;
+    color: #0f0;
+    border-radius: 4px;
+    font-size: 14px;
+    text-align: center;
+}
+.btn {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: bold;
+}
+.btn-set {
+    background: #0a0;
+    color: #fff;
+}
+.btn-set:active {
+    background: #080;
+}
+.btn-reset {
+    background: #444;
+    color: #aaa;
+    font-size: 11px;
+    padding: 4px 8px;
+}
+
+/* Toast notification */
+.toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #0a0;
+    color: #fff;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 14px;
+    display: none;
+    z-index: 999;
+}
+.toast.error { background: #a00; }
+
+/* Action buttons */
+.actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+.btn-save {
+    background: #005a9e;
+    color: #fff;
+    flex: 1;
+}
+.btn-load {
+    background: #555;
+    color: #fff;
+    flex: 1;
+}
+.btn-refresh {
+    background: #333;
+    color: #0f0;
+    flex: 1;
+}
+
+/* Nav */
+.nav {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.nav a {
+    color: #0af;
+    font-size: 13px;
+    text-decoration: none;
+}
+</style>
+</head>
+<body>
+
+<h1>🚁 PID Tuner</h1>
+
+<div class="nav">
+    <a href="/">Tuner</a>
+    <a href="/network">Network</a>
+</div>
+
+<!-- Live Telemetry Bar -->
+<div class="telem">
+    <div class="telem-item">
+        Mode: <span id="t-mode">--</span>
+    </div>
+    <div class="telem-item">
+        Armed: <span id="t-armed">--</span>
+    </div>
+    <div class="telem-item">
+        Alt: <span id="t-alt">--</span>m
+    </div>
+    <div class="telem-item">
+        Bat: <span id="t-bat">--</span>V
+    </div>
+    <div class="telem-item">
+        Pitch: <span id="t-pitch">--</span>
+    </div>
+    <div class="telem-item">
+        Roll: <span id="t-roll">--</span>
+    </div>
+    <div class="telem-item">
+        Sats: <span id="t-sats">--</span>
+    </div>
+</div>
+
+<!-- Action Buttons -->
+<div class="actions">
+    <button class="btn btn-refresh"
+            onclick="loadAllParams()">
+        🔄 Refresh Params
+    </button>
+    <button class="btn btn-save"
+            onclick="saveParams()">
+        💾 Save Params
+    </button>
+    <button class="btn btn-load"
+            onclick="loadParams()">
+        📂 Load Params
+    </button>
+</div>
+
+<!-- Group Tabs -->
+<div class="tabs" id="tabs"></div>
+
+<!-- Param Groups -->
+<div id="groups"></div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+const socket = io();
+let allParams = {};
+
+// Telemetry
+socket.on('telemetry', (d) => {
+    document.getElementById('t-mode')
+        .textContent = d.mode;
+    document.getElementById('t-armed')
+        .textContent = d.armed ?
+            '🔴 YES' : '🟢 NO';
+    document.getElementById('t-alt')
+        .textContent = d.altitude.toFixed(1);
+    document.getElementById('t-bat')
+        .textContent = d.battery.toFixed(1);
+    document.getElementById('t-pitch')
+        .textContent = d.pitch.toFixed(3);
+    document.getElementById('t-roll')
+        .textContent = d.roll.toFixed(3);
+    document.getElementById('t-sats')
+        .textContent = d.satellites;
+});
+
+// Show toast notification
+function showToast(msg, isError=false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast' +
+        (isError ? ' error' : '');
+    t.style.display = 'block';
+    setTimeout(() => {
+        t.style.display = 'none';
+    }, 2500);
+}
+
+// Load all params from drone
+async function loadAllParams() {
+    showToast('Loading params...');
+    try {
+        const r = await fetch('/pid/all');
+        allParams = await r.json();
+        renderParams(allParams);
+        showToast('Params loaded!');
+    } catch(e) {
+        showToast('Load failed!', true);
+    }
+}
+
+// Render param groups and tabs
+function renderParams(data) {
+    const tabsEl =
+        document.getElementById('tabs');
+    const groupsEl =
+        document.getElementById('groups');
+    tabsEl.innerHTML = '';
+    groupsEl.innerHTML = '';
+
+    let first = true;
+    for (const [group, params] of
+         Object.entries(data)) {
+
+        // Create tab
+        const tab = document.createElement('div');
+        tab.className = 'tab' +
+            (first ? ' active' : '');
+        tab.textContent = group;
+        tab.onclick = () => switchTab(group);
+        tab.id = 'tab-' + group;
+        tabsEl.appendChild(tab);
+
+        // Create group div
+        const div = document.createElement('div');
+        div.className = 'group' +
+            (first ? ' active' : '');
+        div.id = 'group-' + group;
+
+        div.innerHTML = `<h2>${group}</h2>`;
+
+        for (const [param, info] of
+             Object.entries(params)) {
+            if (info.value === null) continue;
+
+            div.innerHTML += `
+<div class="param-row" id="row-${param}">
+    <div>
+        <div class="param-label">
+            ${info.label}
+        </div>
+        <div class="param-name">${param}</div>
+    </div>
+    <input class="param-input"
+           type="number"
+           id="input-${param}"
+           value="${info.value}"
+           step="0.001">
+    <button class="btn btn-set"
+            onclick="setParam('${param}')">
+        SET
+    </button>
+    <button class="btn btn-reset"
+            onclick="resetParam('${param}')">
+        RST
+    </button>
+</div>`;
+        }
+        groupsEl.appendChild(div);
+        first = false;
+    }
+}
+
+// Switch active tab
+function switchTab(group) {
+    document.querySelectorAll('.tab')
+        .forEach(t => t.classList
+            .remove('active'));
+    document.querySelectorAll('.group')
+        .forEach(g => g.classList
+            .remove('active'));
+    document.getElementById('tab-' + group)
+        .classList.add('active');
+    document.getElementById('group-' + group)
+        .classList.add('active');
+}
+
+// Set single param
+async function setParam(param) {
+    const input = document
+        .getElementById('input-' + param);
+    const value = parseFloat(input.value);
+
+    if (isNaN(value)) {
+        showToast('Invalid value!', true);
+        return;
+    }
+
+    try {
+        const r = await fetch('/pid/set', {
+            method: 'POST',
+            headers: {
+                'Content-Type':
+                    'application/json'
+            },
+            body: JSON.stringify({
+                param, value
+            })
+        });
+        const data = await r.json();
+        if (data.success) {
+            showToast(
+                `✅ ${param} = ${value}`);
+            // Flash green
+            const row = document
+                .getElementById(
+                    'row-' + param);
+            row.style.borderLeft =
+                '3px solid #0f0';
+            setTimeout(() => {
+                row.style.borderLeft = '';
+            }, 1000);
+        } else {
+            showToast(
+                `❌ ${data.error}`, true);
+        }
+    } catch(e) {
+        showToast('Set failed!', true);
+    }
+}
+
+// Reset param to default
+async function resetParam(param) {
+    if (!confirm(
+        `Reset ${param} to default?`)) return;
+
+    try {
+        const r = await fetch('/pid/reset', {
+            method: 'POST',
+            headers: {
+                'Content-Type':
+                    'application/json'
+            },
+            body: JSON.stringify({ param })
+        });
+        const data = await r.json();
+        if (data.success) {
+            document
+                .getElementById(
+                    'input-' + param)
+                .value = data.default_value;
+            showToast(
+                `Reset ${param} to `+
+                `${data.default_value}`);
+        } else {
+            showToast(data.error, true);
+        }
+    } catch(e) {
+        showToast('Reset failed!', true);
+    }
+}
+
+// Save params to file
+async function saveParams() {
+    const name = prompt(
+        'Save as filename:',
+        'pid_backup.json');
+    if (!name) return;
+
+    try {
+        const r = await fetch('/pid/save', {
+            method: 'POST',
+            headers: {
+                'Content-Type':
+                    'application/json'
+            },
+            body: JSON.stringify({
+                filename: name
+            })
+        });
+        const data = await r.json();
+        if (data.success) {
+            showToast(
+                `💾 Saved ${data.count} params`);
+        } else {
+            showToast(data.error, true);
+        }
+    } catch(e) {
+        showToast('Save failed!', true);
+    }
+}
+
+// Load params from file
+async function loadParams() {
+    // Get list of files first
+    const r = await fetch('/pid/files');
+    const data = await r.json();
+
+    if (!data.files || !data.files.length) {
+        showToast('No saved files found!',
+            true);
+        return;
+    }
+
+    const file = prompt(
+        'Available: ' +
+        data.files.join(', ') +
+        '\n\nLoad which file:',
+        data.files[0]);
+    if (!file) return;
+
+    try {
+        const r2 = await fetch('/pid/load', {
+            method: 'POST',
+            headers: {
+                'Content-Type':
+                    'application/json'
+            },
+            body: JSON.stringify({
+                filename: file
+            })
+        });
+        const d2 = await r2.json();
+        if (d2.success) {
+            showToast(
+                `📂 Loaded ${d2.loaded} params`);
+            loadAllParams();
+        } else {
+            showToast(d2.error, true);
+        }
+    } catch(e) {
+        showToast('Load failed!', true);
+    }
+}
+
+// Load params on page open
+loadAllParams();
+</script>
+</body>
+</html>
