@@ -14,6 +14,9 @@ import time
 import cv2
 import subprocess
 
+from movement_controller import MovementController
+from mission_manager import MissionManager
+
 def scan_networks():
     print("Triggering Wi-Fi environment rescan...")
     subprocess.run(
@@ -204,6 +207,10 @@ _takeoff_cancelled = False
 # motion cancel flag - set by hold/emergency to abort send_velocity loop mid-move
 _motion_cancelled = False
 
+# movement controller and mission manager (initialised after drone connects)
+mc = None
+mm = None
+
 # ─── PID Tuner Config ────────────────────
 PID_SAVES_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'pid_saves'
@@ -271,7 +278,7 @@ PID_GROUPS = {
 
 # ─── Connect Drone ───────────────────────
 def connect_drone():
-    global vehicle
+    global vehicle, mc, mm
     print("Connecting to Pixhawk...")
     vehicle = connect(
         '/dev/ttyAMA0',
@@ -279,6 +286,9 @@ def connect_drone():
         wait_ready=False
     )
     print("Drone connected!")
+    mc = MovementController(vehicle)
+    mm = MissionManager(vehicle)
+    print("MovementController and MissionManager initialised.")
 
 # ─── Safe Value Helpers ──────────────────
 # FIX 2: DroneKit fields can return None; these prevent TypeError crashes.
@@ -399,27 +409,6 @@ def get_status_data():
         "vibe_z":        vibe_z,
     }
 
-def send_velocity(vx, vy, vz, duration):
-    global _motion_cancelled
-    _motion_cancelled = False
-    msg = vehicle.message_factory\
-        .set_position_target_local_ned_encode(
-        0, 0, 0,
-        mavutil.mavlink.MAV_FRAME_BODY_NED,
-        0b0000111111000111,
-        0, 0, 0,
-        vx, vy, vz,
-        0, 0, 0,
-        0, 0)
-    start = time.time()
-    while time.time() - start < duration:
-        if _motion_cancelled:
-            print("Motion cancelled by external command.")
-            break
-        vehicle.send_mavlink(msg)
-        time.sleep(0.1)
-    send_stop()
-
 def send_stop():
     msg = vehicle.message_factory\
         .set_position_target_local_ned_encode(
@@ -445,125 +434,6 @@ def send_yaw(heading, speed, direction, relative):
         0, 0, 0
     )
     vehicle.send_mavlink(msg)
-
-def arm_and_takeoff(altitude):
-    """Runs in daemon thread. Releases _cmd_lock when done."""
-    global _takeoff_cancelled
-    _takeoff_cancelled = False
-    try:
-        if vehicle.gps_0.fix_type < 3:
-            vehicle.mode = VehicleMode("GUIDED_NOGPS")
-        else:
-            vehicle.mode = VehicleMode("GUIDED")
-
-        time.sleep(1)
-
-        vehicle.armed = True
-        start = time.time()
-        while not vehicle.armed:
-            if time.time() - start > 15:
-                print("Arm failed!")
-                return
-            print("Waiting for arm...")
-            time.sleep(0.5)
-
-        print("Armed!")
-
-        if vehicle.gps_0.fix_type >= 3:
-            vehicle.simple_takeoff(altitude)
-            while True:
-                alt = vehicle.location\
-                    .global_relative_frame.alt
-                print(f"Altitude: {alt:.1f}m")
-                if alt >= altitude * 0.95:
-                    break
-                time.sleep(0.5)
-        else:
-            print("No GPS - using thrust control")
-            hover_thrust = 0.3732573
-            climb_thrust = hover_thrust + 0.20
-            target_alt   = altitude
-
-            start = time.time()
-            while True:
-                if _takeoff_cancelled:
-                    print("Takeoff cancelled by external command.")
-                    return
-                    
-                if not vehicle.armed:
-                    print("Unexpected disarm during takeoff!")
-                    return
-
-                if vehicle.mode.name not in ('GUIDED', 'GUIDED_NOGPS'):
-                    print(f"Mode changed to {vehicle.mode.name}, aborting takeoff.")
-                    return
-                
-                current_alt = safe_float(vehicle.rangefinder.distance)
-                if current_alt <= 0:
-                    current_alt = 0.0
-
-                msg = vehicle.message_factory\
-                    .set_attitude_target_encode(
-                    0,
-                    1, 1,
-                    0b00000111,
-                    [1, 0, 0, 0],
-                    0, 0, 0,
-                    climb_thrust
-                )
-                vehicle.send_mavlink(msg)
-                print(f"Alt(rangefinder): {current_alt:.2f}/{target_alt}m thrust:{climb_thrust:.3f}")
-
-                if current_alt >= target_alt * 0.95:
-                    print("Target altitude reached!")
-                    break
-
-                if time.time() - start > 30:
-                    print("Takeoff timeout!")
-                    vehicle.mode = VehicleMode("LAND")
-                    return
-
-                time.sleep(0.1)
-
-            for i in range(20):
-                msg = vehicle.message_factory\
-                    .set_attitude_target_encode(
-                    0,
-                    1, 1,
-                    0b00000111,
-                    [1, 0, 0, 0],
-                    0, 0, 0,
-                    hover_thrust
-                )
-                vehicle.send_mavlink(msg)
-                time.sleep(0.1)
-    finally:
-        _cmd_lock.release()
-
-def _arm_drone():
-    """Runs in daemon thread. Releases _cmd_lock when done."""
-    try:
-        vehicle.armed = True
-        start = time.time()
-        while not vehicle.armed:
-            if time.time() - start > 15:
-                print("Arm failed!")
-                return
-            print("Waiting for arm...")
-            time.sleep(0.5)
-        print("Armed!")
-    finally:
-        _cmd_lock.release()
-
-def _send_velocity_locked(vx, vy, vz, duration):
-    """Wrapper that releases _cmd_lock after send_velocity completes, then returns to LOITER."""
-    try:
-        send_velocity(vx, vy, vz, duration)
-        # Switch back to LOITER for position hold after move
-        if vehicle and vehicle.armed:
-            vehicle.mode = VehicleMode("LOITER")
-    finally:
-        _cmd_lock.release()
 
 def _send_yaw_locked(heading, speed, direction, relative):
     """Wrapper that releases _cmd_lock after send_yaw completes."""
@@ -840,9 +710,13 @@ def takeoff():
             _cmd_lock.release()
             return jsonify({"success": False, "message": "Min altitude is 0.5m"}), 400
 
-        # Lock released inside arm_and_takeoff (in finally block)
-        thread = threading.Thread(target=arm_and_takeoff, args=(altitude,))
-        thread.daemon = True
+        def _takeoff_worker():
+            try:
+                mc.takeoff(altitude)
+            finally:
+                _cmd_lock.release()
+
+        thread = threading.Thread(target=_takeoff_worker, daemon=True)
         thread.start()
 
         return jsonify({
@@ -908,31 +782,24 @@ def move():
             _cmd_lock.release()
             return jsonify({"success": False, "message": "Drone not armed — takeoff first"}), 400
 
-        duration = distance / speed
-
-        direction_map = {
-            'forward':  ( speed,   0,      0),
-            'backward': (-speed,   0,      0),
-            'left':     ( 0,      -speed,  0),
-            'right':    ( 0,       speed,  0),
-            'up':       ( 0,       0,     -speed),
-            'down':     ( 0,       0,      speed),
+        direction_to_mc = {
+            'forward':  lambda: mc.move(north_m=distance,  speed=speed),
+            'backward': lambda: mc.move(north_m=-distance, speed=speed),
+            'left':     lambda: mc.move(east_m=-distance,  speed=speed),
+            'right':    lambda: mc.move(east_m=distance,   speed=speed),
+            'up':       lambda: mc.move(down_m=-distance,  speed=speed),
+            'down':     lambda: mc.move(down_m=distance,   speed=speed),
         }
 
-        vx, vy, vz = direction_map[direction]
+        move_fn = direction_to_mc[direction]
 
-        # velocity commands only work in GUIDED / GUIDED_NOGPS
-        current_mode = vehicle.mode.name
-        if current_mode not in ('GUIDED', 'GUIDED_NOGPS'):
-            vehicle.mode = VehicleMode("GUIDED_NOGPS")
-            time.sleep(0.3)
+        def _move_worker():
+            try:
+                move_fn()
+            finally:
+                _cmd_lock.release()
 
-        # Lock released inside _send_velocity_locked (in finally block)
-        thread = threading.Thread(
-            target=_send_velocity_locked,
-            args=(vx, vy, vz, duration)
-        )
-        thread.daemon = True
+        thread = threading.Thread(target=_move_worker, daemon=True)
         thread.start()
 
         return jsonify({
@@ -941,7 +808,6 @@ def move():
             "direction": direction,
             "distance":  distance,
             "speed":     speed,
-            "duration":  round(duration, 2),
         })
     except Exception as e:
         _cmd_lock.release()
@@ -1051,9 +917,10 @@ def hold():
     try:
         _takeoff_cancelled = True
         _motion_cancelled  = True
-        time.sleep(0.15)  # brief wait for both loops to see cancel flags
-        vehicle.mode = VehicleMode("LOITER")
-        return jsonify({"success": True, "message": "Holding position (LOITER + optical flow)"})
+        res = mc.hold()
+        if res["ok"]:
+            return jsonify({"success": True, "message": res["message"]})
+        return jsonify({"success": False, "message": res["message"]}), 500
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -1066,12 +933,39 @@ def emergency():
     try:
         _takeoff_cancelled = True
         _motion_cancelled  = True
-        vehicle.mode = VehicleMode("LAND")
-        time.sleep(1)
-        vehicle.armed = False
+        mc.emergency_stop()
         return jsonify({"success": True, "message": "Emergency stop executed"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
+
+# ─── Mission Endpoints ───────────────────
+
+@app.route('/mission', methods=['POST'])
+def mission_start():
+    if not mm:
+        return jsonify({"success": False, "message": "Drone not connected"}), 503
+    if mm.is_busy():
+        return jsonify({"success": False, "message": "Mission already running"}), 409
+    try:
+        data  = request.json or {}
+        steps = data.get('steps', [])
+        if not steps:
+            return jsonify({"success": False, "message": "steps list required"}), 400
+        mm.run_mission(steps, blocking=False)
+        return jsonify({"success": True, "message": "Mission started", "steps": len(steps)})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/mission/status', methods=['GET'])
+def mission_status():
+    return jsonify(mm.status if mm else {})
+
+@app.route('/mission/cancel', methods=['POST'])
+def mission_cancel():
+    if not mm:
+        return jsonify({"success": False, "message": "Drone not connected"}), 503
+    mm.mc.cancel()
+    return jsonify({"success": True, "message": "Mission cancel signal sent"})
 
 # ─── Camera Routes ───────────────────────
 
