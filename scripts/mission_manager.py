@@ -8,7 +8,8 @@ class MissionManager:
 
     def __init__(self, vehicle):
         self.mc = MovementController(vehicle)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards entire _execute() body
+        self._start_lock = threading.Lock()  # atomic check-and-set for active flag
         self._status = {
             "active":       False,
             "current_step": None,
@@ -18,7 +19,8 @@ class MissionManager:
         }
 
     def is_busy(self) -> bool:
-        return self._status["active"]
+        with self._start_lock:
+            return self._status["active"]
 
     @property
     def status(self) -> dict:
@@ -60,11 +62,11 @@ class MissionManager:
 
     def move_up(self, distance=0.5, speed=0.3) -> dict:
         return self._run_single("move_up",
-            lambda: self.mc.move(down_m=-distance, speed=speed))
+            lambda: self.mc.move(down_m=distance, speed=speed))
 
     def move_down(self, distance=0.5, speed=0.3) -> dict:
         return self._run_single("move_down",
-            lambda: self.mc.move(down_m=distance, speed=speed))
+            lambda: self.mc.move(down_m=-distance, speed=speed))
 
     def yaw_right(self, degrees=90, speed=30) -> dict:
         return self._run_single("yaw_right",
@@ -80,6 +82,11 @@ class MissionManager:
     # ── Mission sequencer ─────────────────────────────────────────────
 
     def run_mission(self, steps: list, blocking=False) -> dict:
+        with self._start_lock:
+            if self._status["active"]:
+                return {"ok": False, "steps_done": 0, "message": "Mission already running"}
+            self._status["active"] = True  # claim before thread starts — prevents TOCTOU
+
         CMD_MAP = {
             "takeoff":       lambda s: self.takeoff(s.get("altitude", 1.5)),
             "land":          lambda s: self.land(),
@@ -96,21 +103,20 @@ class MissionManager:
         }
 
         def _execute():
-            with self._lock:
-                self._status.update({
-                    "active":       True,
-                    "steps_done":   0,
-                    "current_step": None,
-                    "last_result":  None,
-                    "error":        None,
-                })
-                self.mc.clear_cancel()
+            self._status.update({
+                "steps_done":   0,
+                "current_step": None,
+                "last_result":  None,
+                "error":        None,
+            })
+            self.mc.clear_cancel()
 
+            try:
                 for i, step in enumerate(steps):
                     cmd = step.get("cmd")
                     if cmd not in CMD_MAP:
                         msg = f"Unknown command: {cmd}"
-                        self._status.update({"error": msg, "active": False})
+                        self._status.update({"error": msg})
                         return {"ok": False, "steps_done": i, "message": msg}
 
                     result = CMD_MAP[cmd](step)
@@ -118,18 +124,17 @@ class MissionManager:
 
                     if not result.get("ok"):
                         if not step.get("ignore_error"):
-                            self._status.update({
-                                "error":  result.get("message", "Step failed"),
-                                "active": False,
-                            })
+                            self._status["error"] = result.get("message", "Step failed")
                             return {
-                                "ok":        False,
+                                "ok":         False,
                                 "steps_done": i + 1,
-                                "message":   self._status["error"],
+                                "message":    self._status["error"],
                             }
 
-                self._status["active"] = False
                 return {"ok": True, "steps_done": len(steps), "message": "Mission complete"}
+            finally:
+                with self._start_lock:
+                    self._status["active"] = False
 
         if blocking:
             return _execute()

@@ -286,6 +286,10 @@ def connect_drone():
         wait_ready=False
     )
     print("Drone connected!")
+    vehicle.parameters['WPNAV_SPEED']    = 30   # 0.3 m/s horizontal
+    vehicle.parameters['WPNAV_SPEED_UP'] = 30   # 0.3 m/s ascend
+    vehicle.parameters['WPNAV_SPEED_DN'] = 30   # 0.3 m/s descend
+    print("Speed params set: WPNAV_SPEED=30 UP=30 DN=30 cm/s")
     mc = MovementController(vehicle)
     mm = MissionManager(vehicle)
     print("MovementController and MissionManager initialised.")
@@ -600,6 +604,12 @@ def status():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
+def _arm_drone():
+    try:
+        mc._arm()
+    finally:
+        _cmd_lock.release()
+
 @app.route('/arm', methods=['POST'])
 def arm():
     if not vehicle:
@@ -787,8 +797,8 @@ def move():
             'backward': lambda: mc.move(north_m=-distance, speed=speed),
             'left':     lambda: mc.move(east_m=-distance,  speed=speed),
             'right':    lambda: mc.move(east_m=distance,   speed=speed),
-            'up':       lambda: mc.move(down_m=-distance,  speed=speed),
-            'down':     lambda: mc.move(down_m=distance,   speed=speed),
+            'up':       lambda: mc.move(down_m=distance,   speed=speed),
+            'down':     lambda: mc.move(down_m=-distance,  speed=speed),
         }
 
         move_fn = direction_to_mc[direction]
@@ -834,14 +844,13 @@ def yaw():
             _cmd_lock.release()
             return jsonify({"success": False, "message": "Max rotation is 360 degrees"}), 400
 
-        spin = 1 if direction == 'right' else -1
+        def _yaw_worker():
+            try:
+                mc.yaw(degrees, clockwise=(direction == 'right'), speed_dps=speed)
+            finally:
+                _cmd_lock.release()
 
-        # Lock released inside _send_yaw_locked (in finally block)
-        thread = threading.Thread(
-            target=_send_yaw_locked,
-            args=(degrees, speed, spin, 1)
-        )
-        thread.daemon = True
+        thread = threading.Thread(target=_yaw_worker, daemon=True)
         thread.start()
 
         return jsonify({

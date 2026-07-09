@@ -38,7 +38,11 @@ class MovementController:
                 self._v.mode = VehicleMode("LAND")
                 return self._fail("Takeoff timed out after 30s")
 
-            current_alt = float(self._v.rangefinder.distance or 0)
+            rf_dist = self._v.rangefinder.distance
+            if rf_dist is None:
+                self._v.mode = VehicleMode("LAND")
+                return self._fail("Rangefinder not ready (None) — aborting takeoff")
+            current_alt = float(rf_dist)
             self._send_attitude_thrust(climb_thrust)
             print(f"[MC] alt {current_alt:.2f}/{altitude_m:.2f}m")
 
@@ -74,13 +78,18 @@ class MovementController:
             local = self._v.location.local_frame
             if local.north is None:
                 return self._fail("EKF not ready: local_frame.north is None")
-            target_n = local.north + north_m
-            target_e = local.east + east_m
-            target_d = local.down - down_m  # down axis inverted
+            # Rotate body-relative offset by current yaw so "forward" = drone nose
+            yaw = self._v.attitude.yaw  # radians, 0=North, +CW
+            rotated_n = north_m * math.cos(yaw) - east_m * math.sin(yaw)
+            rotated_e = north_m * math.sin(yaw) + east_m * math.cos(yaw)
+            target_n = local.north + rotated_n
+            target_e = local.east  + rotated_e
+            target_d = local.down  - down_m  # down axis inverted
         except Exception as e:
             return self._fail(f"Could not read local frame: {e}")
 
-        print(f"[MC] move target NED: ({target_n:.2f}, {target_e:.2f}, {target_d:.2f})")
+        print(f"[MC] move target NED: ({target_n:.2f}, {target_e:.2f}, {target_d:.2f})"
+              f" (yaw={math.degrees(yaw):.1f}°)")
 
         start = time.time()
         ok_count = 0
@@ -100,7 +109,8 @@ class MovementController:
                 local = self._v.location.local_frame
                 pos_error = math.sqrt(
                     (local.north - target_n) ** 2 +
-                    (local.east  - target_e) ** 2
+                    (local.east  - target_e) ** 2 +
+                    (local.down  - target_d) ** 2
                 )
                 v = self._v.velocity
                 spd = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
