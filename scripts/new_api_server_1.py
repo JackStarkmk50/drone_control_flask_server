@@ -283,7 +283,7 @@ def connect_drone():
     vehicle = connect(
         '/dev/ttyAMA0',
         baud=57600,
-        wait_ready=False
+        wait_ready=True
     )
     print("Drone connected!")
     vehicle.parameters['WPNAV_SPEED']    = 30   # 0.3 m/s horizontal
@@ -606,7 +606,9 @@ def status():
 
 def _arm_drone():
     try:
+        mc._switch_mode("GUIDED_NOGPS")
         mc._arm()
+        return jsonify({"success": True, "message": "inside_arm_drone"})
     finally:
         _cmd_lock.release()
 

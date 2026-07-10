@@ -192,7 +192,7 @@ class MovementController:
         self._send_stop()
         if self._v.mode.name != "GUIDED_NOGPS":
             self._switch_mode("GUIDED_NOGPS")
-        return {"ok": True, "message": "Holding position"}
+        return self._success("Holding position")
 
     def land(self) -> dict:
         self.cancel()
@@ -207,7 +207,7 @@ class MovementController:
                 return self._fail("Land timed out: still armed after 30s")
             time.sleep(0.5)
 
-        return {"ok": True, "message": "Landed and disarmed"}
+        return self._success("Landed and disarmed")
 
     def emergency_stop(self):
         self.cancel()
@@ -247,7 +247,7 @@ class MovementController:
                 if time.time() - start > 5:
                     return self._fail(f"Mode switch to {mode_name} timed out")
                 time.sleep(0.1)
-            return {"ok": True}
+            return self._success(f"Mode switched to {mode_name}")
         except Exception as e:
             return self._fail(str(e))
 
@@ -261,7 +261,7 @@ class MovementController:
                 print("[MC] Waiting for arm…")
                 time.sleep(0.5)
             print("[MC] Armed!")
-            return {"ok": True}
+            return self._success("Armed")
         except Exception as e:
             return self._fail(str(e))
 
@@ -303,3 +303,7 @@ class MovementController:
     def _fail(self, reason: str) -> dict:
         print(f"[MC] FAIL: {reason}")
         return {"ok": False, "message": reason}
+    
+    def _success(self, reason: str) -> dict:
+        print(f"[MC] Success: {reason}")
+        return {"ok": True, "message": reason}
