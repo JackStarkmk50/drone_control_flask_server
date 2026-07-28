@@ -18,7 +18,7 @@ class MovementController:
     def takeoff(self, altitude_m: float) -> dict:
         self.clear_cancel()
 
-        res = self._switch_mode("GUIDED_NOGPS")
+        res = self._switch_mode("GUIDED")
         if not res["ok"]:
             return res
 
@@ -70,7 +70,7 @@ class MovementController:
     def move(self, north_m=0.0, east_m=0.0, down_m=0.0, speed=0.3) -> dict:
         self.clear_cancel()
 
-        res = self._switch_mode("GUIDED_NOGPS")
+        res = self._switch_mode("GUIDED")
         if not res["ok"]:
             return res
 
@@ -134,7 +134,7 @@ class MovementController:
             speed_dps: float = 30) -> dict:
         self.clear_cancel()
 
-        res = self._switch_mode("GUIDED_NOGPS")
+        res = self._switch_mode("GUIDED")
         if not res["ok"]:
             return res
 
@@ -190,8 +190,8 @@ class MovementController:
         self._cancel.set()
         time.sleep(0.05)
         self._send_stop()
-        if self._v.mode.name != "GUIDED_NOGPS":
-            self._switch_mode("GUIDED_NOGPS")
+        if self._v.mode.name != "GUIDED":
+            self._switch_mode("GUIDED")
         return self._success("Holding position")
 
     def land(self) -> dict:

@@ -283,12 +283,9 @@ def connect_drone():
     vehicle = connect(
         '/dev/ttyAMA0',
         baud=57600,
-        wait_ready=True
+        wait_ready=False
     )
     print("Drone connected!")
-    vehicle.parameters['WPNAV_SPEED']    = 30   # 0.3 m/s horizontal
-    vehicle.parameters['WPNAV_SPEED_UP'] = 30   # 0.3 m/s ascend
-    vehicle.parameters['WPNAV_SPEED_DN'] = 30   # 0.3 m/s descend
     print("Speed params set: WPNAV_SPEED=30 UP=30 DN=30 cm/s")
     mc = MovementController(vehicle)
     mm = MissionManager(vehicle)
@@ -460,10 +457,14 @@ def stream_telemetry():
 def start_camera():
     global camera, camera_active
 
+    print("camera started")
+
     # Early exit if already running (checked outside lock for speed)
     with camera_lock:
         if camera is not None:
             return
+
+    print("Video Capture is starting")
 
     # Open and configure outside lock so 1s settle sleep doesn't block other threads
     cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
@@ -476,6 +477,12 @@ def start_camera():
     with camera_lock:
         if camera is None:  # re-check: another thread may have started it during sleep
             if cap.isOpened():
+                ret, frame = cap.read()
+
+                if not ret:
+                    cap.release()
+                    raise RuntimeError("camera opened but failed to read first frame")
+
                 camera        = cap
                 camera_active = True
                 print("Camera started")
@@ -494,12 +501,14 @@ def stop_camera():
             print("Camera stopped")
 
 def generate_frames():
+    print("[Cam] Generator Started")
     start_camera()
 
     error_count = 0
     max_errors  = 10  # stop stream after 10 consecutive read failures
 
     while camera_active:
+    
         # Grab local reference under lock — prevents crash if stop_camera() runs concurrently
         with camera_lock:
             cap = camera
@@ -513,7 +522,6 @@ def generate_frames():
             error_count += 1
             if error_count >= max_errors:
                 print(f"Camera: {max_errors} consecutive failures, stopping stream")
-                stop_camera()
                 break
             socketio.sleep(0.1)
             continue
@@ -606,7 +614,7 @@ def status():
 
 def _arm_drone():
     try:
-        mc._switch_mode("GUIDED_NOGPS")
+        mc._switch_mode("GUIDED")
         mc._arm()
         return jsonify({"success": True, "message": "inside_arm_drone"})
     finally:
@@ -980,7 +988,7 @@ def mission_cancel():
 
 # ─── Camera Routes ───────────────────────
 
-@app.route('/video_feed', methods=['GET'])
+@app.route('/camera/stream', methods=['GET'])
 def video_feed():
     return Response(
         generate_frames(),
