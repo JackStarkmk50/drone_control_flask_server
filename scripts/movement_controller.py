@@ -12,6 +12,60 @@ class MovementController:
         self._v = vehicle
         self._cancel = threading.Event()
         self._lock = threading.Lock()
+        # Add in __init__:
+        self._rc = {
+            "roll": 1500, "pitch": 1500,
+            "throttle": 1500, "yaw": 1500
+        }
+        self._rc_running = False
+        self._rc_lock = threading.Lock()
+
+
+        # Add method: start RC thread
+    def start_rc_override(self):
+        if self._rc_running:
+            return
+        self._rc_running = True
+        threading.Thread(
+            target=self._rc_sender,
+            daemon=True).start()
+
+    # Background sender
+    def _rc_sender(self):
+        while self._rc_running:
+            with self._rc_lock:
+                r = self._rc["roll"]
+                p = self._rc["pitch"]
+                t = self._rc["throttle"]
+                y = self._rc["yaw"]
+            msg = self._v.message_factory\
+                .rc_channels_override_encode(
+                1,1, r,p,t,y, 0,0,0,0)
+            self._v.send_mavlink(msg)
+            time.sleep(0.05)  # 20Hz
+
+    # Set RC values
+    def set_rc(self, roll=1500, pitch=1500,
+            throttle=1500, yaw=1500):
+        def c(v): return max(1000,min(2000,int(v)))
+        with self._rc_lock:
+            self._rc = {
+                "roll":     c(roll),
+                "pitch":    c(pitch),
+                "throttle": c(throttle),
+                "yaw":      c(yaw)
+            }
+
+    # Reset channel to center
+    def rc_hold(self, *channels):
+        with self._rc_lock:
+            for ch in (channels or
+                ["roll","pitch","throttle","yaw"]):
+                self._rc[ch] = 1500
+
+    # Stop RC thread
+    def stop_rc_override(self):
+        self._rc_running = False
 
     # ── Public interface ──────────────────────────────────────────────
 

@@ -13,6 +13,7 @@ import threading
 import time
 import cv2
 import subprocess
+from webrtc.routes import bp as webrtc_bp
 
 from movement_controller import MovementController
 from mission_manager import MissionManager
@@ -173,6 +174,11 @@ app = Flask(__name__,
 
 CORS(app)  # handles OPTIONS preflight responses
 
+app.register_blueprint(
+    webrtc_bp,
+    url_prefix="/webrtc"
+)
+
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin']  = '*'
@@ -276,6 +282,19 @@ PID_GROUPS = {
     },
 }
 
+# ===== RC OverRide Config =====
+DIR_MAP = {
+    "forward":       ("pitch",    1350),
+    "backward":      ("pitch",    1650),
+    "right":         ("roll",     1650),
+    "left":          ("roll",     1350),
+    "yaw_right":     ("yaw",      1650),
+    "yaw_left":      ("yaw",      1350),
+    "throttle_up":   ("throttle", 1650),
+    "throttle_down": ("throttle", 1350),
+}
+
+
 # ─── Connect Drone ───────────────────────
 def connect_drone():
     global vehicle, mc, mm
@@ -290,6 +309,8 @@ def connect_drone():
     mc = MovementController(vehicle)
     mm = MissionManager(vehicle)
     print("MovementController and MissionManager initialised.")
+    mc.start_rc_override()  # ← start on connect
+    print("RC override thread started.")
 
 # ─── Safe Value Helpers ──────────────────
 # FIX 2: DroneKit fields can return None; these prevent TypeError crashes.
@@ -1250,6 +1271,57 @@ def queue_clear():
     with _cmd_queue_lock:
         _cmd_queue.clear()
     return jsonify({"success": True, "message": "Queue cleared"})
+
+
+# RC control endpoint
+
+@app.route('/rc', methods=['POST'])
+def rc():
+    if not vehicle: return _no_vehicle()
+    data    = request.json or {}
+    action  = data.get("action","move")
+
+    if action == "start":
+        mc.start_rc_override()
+        return jsonify({"success":True,
+                        "message":"RC started"})
+
+    # if action == "stop":
+    #     mc.stop_rc_override()
+    #     return jsonify({"success":True,
+    #                     "message":"RC stopped"})
+
+    if action == "hold":
+        mc.rc_hold()
+        return jsonify({"success":True,
+                        "message":"Holding"})
+
+    if action == "move":
+        direction = data.get("direction")
+        release   = data.get("release", False)
+
+        if direction not in DIR_MAP:
+            return jsonify({"success":False,
+                "message":f"Unknown: {direction}"}), 400
+
+        channel, default = DIR_MAP[direction]
+
+        if release:
+            mc.rc_hold(channel)
+            return jsonify({"success":True,
+                "message":f"{direction} released"})
+
+        value = int(data.get("value", default))
+        mc.set_rc(**{channel: value})
+        return jsonify({"success":True,
+            "message":f"{direction}={value}"})
+
+    return jsonify({"success":False,
+        "message":"Unknown action"}), 400
+
+# WebRTC endpoint
+
+
 
 # ─── WebSocket ───────────────────────────
 
