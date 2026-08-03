@@ -20,6 +20,67 @@ class MovementController:
         self._rc_running = False
         self._rc_lock = threading.Lock()
 
+        #for closed loop correction
+        self._correction_running = False
+        self._last_rc_cmd = time.time()
+
+
+    def start_correction_loop(self):
+        if self._correction_running:
+            return
+        self._correction_running = True
+        threading.Thread(
+            target=self._correction_sender,
+            daemon=True).start()
+
+    def stop_correction_loop(self):
+        self._correction_running = False
+
+    def _correction_sender(self):
+        """
+        Reads actual attitude vs desired (0,0)
+        Sends small RC correction to cancel drift
+        Runs only when in LOITER and armed
+        RC override still controls main movement
+        """
+        while self._correction_running:
+            try:
+                if (self._v.armed and
+                    self._v.mode.name == "LOITER"):
+
+                    att = self._v.attitude
+                    # pitch: + = nose up = backward
+                    # roll:  + = right tilt
+                    pitch_err = att.pitch  # radians
+                    roll_err  = att.roll
+
+                    # Scale: 0.1 rad = ~50 PWM correction
+                    SCALE = 300
+                    p_corr = int(pitch_err * -SCALE)
+                    r_corr = int(roll_err  * -SCALE)
+
+                    # Only correct if meaningful error
+                    # and no active RC command
+                    if (abs(pitch_err) > 0.02 or
+                        abs(roll_err)  > 0.02):
+                        with self._rc_lock:
+                            # Only correct if sticks centered
+                            if (self._rc["pitch"] == 1500 and
+                                self._rc["roll"]  == 1500):
+                                self._rc["pitch"] = max(1400,
+                                    min(1600, 1500 + p_corr))
+                                self._rc["roll"]  = max(1400,
+                                    min(1600, 1500 + r_corr))
+                    else:
+                        with self._rc_lock:
+                            if (self._rc["pitch"] == 1500 or
+                                self._rc["roll"]  == 1500):
+                                pass  # already centered ✅
+
+            except Exception as e:
+                print(f"[MC] Correction error: {e}")
+            time.sleep(0.05)  # 20Hz
+
 
         # Add method: start RC thread
     def start_rc_override(self):
@@ -72,17 +133,19 @@ class MovementController:
     def takeoff(self, altitude_m: float) -> dict:
         self.clear_cancel()
 
-        res = self._switch_mode("GUIDED")
+        res = self._switch_mode("LOITER")
         if not res["ok"]:
             return res
 
-        hover_thrust = self._get_hover_thrust()
-        climb_thrust = hover_thrust + 0.08
-        print(f"[MC] takeoff: hover={hover_thrust:.4f} climb={climb_thrust:.4f}")
+        # hover_thrust = self._get_hover_thrust()
+        # climb_thrust = hover_thrust + 0.08
+        # print(f"[MC] takeoff: hover={hover_thrust:.4f} climb={climb_thrust:.4f}")
 
         res = self._arm()
         if not res["ok"]:
             return res
+
+        print(f"[MC] Taking off to {altitude_m}m")
 
         start = time.time()
         while True:
@@ -96,35 +159,26 @@ class MovementController:
             if rf_dist is None:
                 self._v.mode = VehicleMode("LAND")
                 return self._fail("Rangefinder not ready (None) — aborting takeoff")
+
             current_alt = float(rf_dist)
-            self._send_attitude_thrust(climb_thrust)
+            # self._send_attitude_thrust(climb_thrust)
             print(f"[MC] alt {current_alt:.2f}/{altitude_m:.2f}m")
 
             if current_alt >= altitude_m * 0.90:
                 print("[MC] Target altitude reached, settling…")
+                self.rc_hold()
                 break
 
-            time.sleep(0.1)
 
-        settle_start = time.time()
-        while time.time() - settle_start < 2.0:
-            self._send_attitude_thrust(hover_thrust)
+            self.set_rc(throttle=1650)  # climb
             time.sleep(0.1)
-
-        try:
-            v = self._v.velocity
-            spd = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
-            if spd > 0.10:
-                print(f"[MC] Warning: still moving at settle ({spd:.2f} m/s)")
-        except Exception:
-            pass
 
         return {"ok": True, "message": f"Takeoff to {altitude_m}m complete"}
 
     def move(self, north_m=0.0, east_m=0.0, down_m=0.0, speed=0.3) -> dict:
         self.clear_cancel()
 
-        res = self._switch_mode("GUIDED")
+        res = self._switch_mode("LOITER")
         if not res["ok"]:
             return res
 

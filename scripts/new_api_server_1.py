@@ -13,7 +13,7 @@ import threading
 import time
 import cv2
 import subprocess
-from webrtc.routes import bp as webrtc_bp
+from scripts.webrtc.routes import bp as webrtc_bp
 
 from movement_controller import MovementController
 from mission_manager import MissionManager
@@ -635,7 +635,7 @@ def status():
 
 def _arm_drone():
     try:
-        mc._switch_mode("GUIDED")
+        mc._switch_mode("LOITER")
         mc._arm()
         return jsonify({"success": True, "message": "inside_arm_drone"})
     finally:
