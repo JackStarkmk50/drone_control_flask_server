@@ -311,6 +311,7 @@ def connect_drone():
     print("MovementController and MissionManager initialised.")
     mc.start_rc_override()  # ← start on connect
     print("RC override thread started.")
+    mc.start_correction_loop()  # ← start on connect for the correction loop
 
 # ─── Safe Value Helpers ──────────────────
 # FIX 2: DroneKit fields can return None; these prevent TypeError crashes.

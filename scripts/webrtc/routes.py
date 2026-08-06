@@ -2,7 +2,7 @@ import asyncio
 
 from flask import Blueprint, jsonify, request
 
-from .signaling import (
+from ...webrtc.signaling import (
     connect,
     disconnect,
     status

@@ -56,7 +56,7 @@ class MovementController:
 
                     # Scale: 0.1 rad = ~50 PWM correction
                     SCALE = 300
-                    p_corr = int(pitch_err * -SCALE)
+                    p_corr = int(pitch_err * SCALE)
                     r_corr = int(roll_err  * -SCALE)
 
                     # Only correct if meaningful error
@@ -71,6 +71,9 @@ class MovementController:
                                     min(1600, 1500 + p_corr))
                                 self._rc["roll"]  = max(1400,
                                     min(1600, 1500 + r_corr))
+                                print(f"[CORR] APPLIED "
+                                      f"pitch→{self._rc['pitch']} "
+                                      f"roll→{self._rc['roll']}")
                     else:
                         with self._rc_lock:
                             if (self._rc["pitch"] == 1500 or
