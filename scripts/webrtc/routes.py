@@ -2,7 +2,7 @@ import asyncio
 
 from flask import Blueprint, jsonify, request
 
-from ...webrtc.signaling import (
+from .signaling import (
     connect,
     disconnect,
     status
@@ -10,8 +10,12 @@ from ...webrtc.signaling import (
 
 bp = Blueprint("webrtc", __name__)
 
+# Route paths are relative to the blueprint's url_prefix ("/webrtc" in
+# new_api_server_1.py). They previously repeated the prefix, producing
+# /webrtc/webrtc/connect, while the client calls /webrtc/connect -> 404.
 
-@bp.route("/webrtc/connect", methods=["POST"])
+
+@bp.route("/connect", methods=["POST"])
 def webrtc_connect():
 
     offer = request.json
@@ -21,7 +25,7 @@ def webrtc_connect():
     return jsonify(answer)
 
 
-@bp.route("/webrtc/disconnect", methods=["POST"])
+@bp.route("/disconnect", methods=["POST"])
 def webrtc_disconnect():
 
     asyncio.run(disconnect())
@@ -29,7 +33,7 @@ def webrtc_disconnect():
     return jsonify({"success": True})
 
 
-@bp.route("/webrtc/status")
+@bp.route("/status")
 def webrtc_status():
 
     return jsonify(status())

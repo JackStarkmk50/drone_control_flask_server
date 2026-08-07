@@ -1,5 +1,5 @@
 import asyncio
-from ...webrtc.peer import WebRTCPeer
+from .peer import WebRTCPeer
 
 
 class WebRTCManager:

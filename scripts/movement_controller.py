@@ -1,9 +1,57 @@
-import math
 import threading
 import time
 
 from dronekit import VehicleMode
-from pymavlink import mavutil
+
+
+# ── RC stream config ─────────────────────────────────────────────
+RC_NEUTRAL   = 1500
+RC_RATE_HZ   = 20          # Pi → FCU override transmit rate. Raise to 50 for
+RC_PERIOD    = 1.0 / RC_RATE_HZ   # crisper response (see notes in BUGS_PLAN_A).
+
+# ── Deadman ──────────────────────────────────────────────────────
+# If a non-neutral stick command is held and no refresh arrives within this
+# window, every channel is forced back to neutral. Prevents a dropped browser
+# / lost network from leaving a movement command latched forever.
+RC_DEADMAN_DEFAULT_S = 0.5
+
+# ── Closed-loop attitude correction ──────────────────────────────
+CORR_RATE_HZ  = 20
+CORR_PERIOD   = 1.0 / CORR_RATE_HZ
+CORR_MODE     = "LOITER"   # only correct while in this mode
+CORR_SCALE    = 300.0      # PWM per radian of attitude error
+CORR_DEADBAND = 0.02       # rad (~1.15°) below which no correction is applied
+CORR_CLAMP    = 100        # max |delta| from neutral, PWM
+
+# Sign of each correction axis. -1 means "an error in the positive direction
+# produces a BELOW-neutral PWM", which is the levelling (negative feedback)
+# direction when the channel is NOT reversed on the flight controller.
+#
+# Both committed param dumps (drone/mav.parm, drone/scripts/mav.parm) report
+# RC1_REVERSED=0 and RC2_REVERSED=0, and DIR_MAP in new_api_server_1.py encodes
+# the same non-reversed convention (forward=1350 / backward=1650). Under that
+# configuration BOTH axes must be -1.
+#
+# ⚠ VERIFY BEFORE FLIGHT:  param show RC2_REVERSED
+#      returns 0  → leave PITCH_CORR_SIGN = -1  (this is the assumption here)
+#      returns 1  → set PITCH_CORR_SIGN = +1 AND flip DIR_MAP's pitch entries
+#    Bench check: tilt nose-up, confirm the pitch channel goes BELOW 1500.
+PITCH_CORR_SIGN = -1
+ROLL_CORR_SIGN  = -1
+
+# ── Takeoff (proportional climb) ─────────────────────────────────
+# In LOITER/ALTHOLD the throttle channel is a climb-RATE demand, not a thrust
+# level: neutral holds altitude, above neutral climbs at a rate scaled by
+# PILOT_SPEED_UP. So the climb command is made proportional to the remaining
+# altitude error — large when far away, shrinking to nothing on arrival. The
+# aircraft decelerates into the target instead of running at a fixed climb rate
+# and being cut dead at 90%, which overshoots and then sags back.
+TAKEOFF_TIMEOUT_S      = 30.0
+TAKEOFF_LOOP_PERIOD    = 0.1
+TAKEOFF_THR_KP         = 120.0   # PWM offset per metre of remaining altitude
+TAKEOFF_THR_MAX_OFFSET = 150     # cap, PWM above neutral
+TAKEOFF_ARRIVE_M       = 0.10    # stop climbing within this distance of target
+TAKEOFF_SETTLE_S       = 2.0     # neutral-throttle settle before declaring done
 
 
 class MovementController:
@@ -11,18 +59,25 @@ class MovementController:
     def __init__(self, vehicle):
         self._v = vehicle
         self._cancel = threading.Event()
-        self._lock = threading.Lock()
-        # Add in __init__:
+
+        # Commanded (teleop / takeoff) stick values. Written by set_rc/rc_hold.
         self._rc = {
-            "roll": 1500, "pitch": 1500,
-            "throttle": 1500, "yaw": 1500
+            "roll": RC_NEUTRAL, "pitch": RC_NEUTRAL,
+            "throttle": RC_NEUTRAL, "yaw": RC_NEUTRAL
         }
+        # Closed-loop correction DELTA, kept separate from _rc so the corrector
+        # never reads back its own output. Summed in _rc_sender at transmit time.
+        self._corr = {"roll": 0, "pitch": 0}
+
         self._rc_running = False
         self._rc_lock = threading.Lock()
 
+        # Deadman: absolute deadline. 0.0 == disabled (no held command).
+        self._deadman_until = 0.0
+        self._deadman_tripped = False
+
         #for closed loop correction
         self._correction_running = False
-        self._last_rc_cmd = time.time()
 
 
     def start_correction_loop(self):
@@ -36,53 +91,58 @@ class MovementController:
     def stop_correction_loop(self):
         self._correction_running = False
 
+    @staticmethod
+    def _clamp_delta(v):
+        return int(max(-CORR_CLAMP, min(CORR_CLAMP, v)))
+
     def _correction_sender(self):
         """
-        Reads actual attitude vs desired (0,0)
-        Sends small RC correction to cancel drift
-        Runs only when in LOITER and armed
-        RC override still controls main movement
+        Closed-loop attitude trim.
+
+        Reads actual attitude vs desired (0,0) and produces a small PWM DELTA,
+        stored in self._corr. _rc_sender adds that delta to the commanded stick
+        value at transmit time, and only on axes the operator is not actively
+        driving.
+
+        The delta is written to a dedicated dict rather than back into self._rc.
+        Writing into _rc was what made the old version fire exactly once: it
+        gated on "_rc pitch and roll are both neutral", then immediately wrote
+        non-neutral values into those same keys, so the gate never reopened.
         """
         while self._correction_running:
+            active = False
             try:
                 if (self._v.armed and
-                    self._v.mode.name == "LOITER"):
+                        self._v.mode.name == CORR_MODE):
 
                     att = self._v.attitude
-                    # pitch: + = nose up = backward
+                    # pitch: + = nose up
                     # roll:  + = right tilt
                     pitch_err = att.pitch  # radians
                     roll_err  = att.roll
 
-                    # Scale: 0.1 rad = ~50 PWM correction
-                    SCALE = 300
-                    p_corr = int(pitch_err * SCALE)
-                    r_corr = int(roll_err  * -SCALE)
-
-                    # Only correct if meaningful error
-                    # and no active RC command
-                    if (abs(pitch_err) > 0.02 or
-                        abs(roll_err)  > 0.02):
+                    if (abs(pitch_err) > CORR_DEADBAND or
+                            abs(roll_err) > CORR_DEADBAND):
+                        p_corr = self._clamp_delta(
+                            pitch_err * PITCH_CORR_SIGN * CORR_SCALE)
+                        r_corr = self._clamp_delta(
+                            roll_err * ROLL_CORR_SIGN * CORR_SCALE)
                         with self._rc_lock:
-                            # Only correct if sticks centered
-                            if (self._rc["pitch"] == 1500 and
-                                self._rc["roll"]  == 1500):
-                                self._rc["pitch"] = max(1400,
-                                    min(1600, 1500 + p_corr))
-                                self._rc["roll"]  = max(1400,
-                                    min(1600, 1500 + r_corr))
-                                print(f"[CORR] APPLIED "
-                                      f"pitch→{self._rc['pitch']} "
-                                      f"roll→{self._rc['roll']}")
-                    else:
-                        with self._rc_lock:
-                            if (self._rc["pitch"] == 1500 or
-                                self._rc["roll"]  == 1500):
-                                pass  # already centered ✅
+                            self._corr["pitch"] = p_corr
+                            self._corr["roll"]  = r_corr
+                        active = True
 
             except Exception as e:
                 print(f"[MC] Correction error: {e}")
-            time.sleep(0.05)  # 20Hz
+
+            # Disarmed, wrong mode, error, or inside the deadband: drop the trim
+            # rather than leaving a stale value latched into the RC stream.
+            if not active:
+                with self._rc_lock:
+                    self._corr["pitch"] = 0
+                    self._corr["roll"]  = 0
+
+            time.sleep(CORR_PERIOD)
 
 
         # Add method: start RC thread
@@ -94,19 +154,56 @@ class MovementController:
             target=self._rc_sender,
             daemon=True).start()
 
+    def _check_deadman_locked(self):
+        """Caller must hold _rc_lock. Centres everything if the hold expired."""
+        if self._deadman_until <= 0.0:
+            return
+        if all(v == RC_NEUTRAL for v in self._rc.values()):
+            self._deadman_until = 0.0     # nothing held, nothing to guard
+            return
+        if time.time() > self._deadman_until:
+            for ch in self._rc:
+                self._rc[ch] = RC_NEUTRAL
+            self._deadman_until = 0.0
+            if not self._deadman_tripped:
+                self._deadman_tripped = True
+                print("[MC] DEADMAN tripped — no refresh from client, "
+                      "all channels forced to neutral")
+
     # Background sender
     def _rc_sender(self):
         while self._rc_running:
-            with self._rc_lock:
-                r = self._rc["roll"]
-                p = self._rc["pitch"]
-                t = self._rc["throttle"]
-                y = self._rc["yaw"]
-            msg = self._v.message_factory\
-                .rc_channels_override_encode(
-                1,1, r,p,t,y, 0,0,0,0)
-            self._v.send_mavlink(msg)
-            time.sleep(0.05)  # 20Hz
+            try:
+                with self._rc_lock:
+                    self._check_deadman_locked()
+                    r = self._rc["roll"]
+                    p = self._rc["pitch"]
+                    t = self._rc["throttle"]
+                    y = self._rc["yaw"]
+                    # Correction trims only the axes not being driven.
+                    if r == RC_NEUTRAL:
+                        r = RC_NEUTRAL + self._corr["roll"]
+                    if p == RC_NEUTRAL:
+                        p = RC_NEUTRAL + self._corr["pitch"]
+                msg = self._v.message_factory\
+                    .rc_channels_override_encode(
+                    1,1, r,p,t,y, 0,0,0,0)
+                self._v.send_mavlink(msg)
+            except Exception as e:
+                # Must never propagate: an uncaught exception here kills the
+                # thread while _rc_running stays True, which makes
+                # start_rc_override() a no-op and leaves RC permanently dead.
+                print(f"[MC] RC send error: {e}")
+            time.sleep(RC_PERIOD)
+
+    def touch_deadman(self, timeout_s=RC_DEADMAN_DEFAULT_S):
+        """Refresh the hold deadline. timeout_s <= 0 disables the deadman."""
+        with self._rc_lock:
+            if timeout_s and timeout_s > 0:
+                self._deadman_until = time.time() + timeout_s
+                self._deadman_tripped = False
+            else:
+                self._deadman_until = 0.0
 
     # Set RC values
     def set_rc(self, roll=1500, pitch=1500,
@@ -125,7 +222,9 @@ class MovementController:
         with self._rc_lock:
             for ch in (channels or
                 ["roll","pitch","throttle","yaw"]):
-                self._rc[ch] = 1500
+                self._rc[ch] = RC_NEUTRAL
+            if all(v == RC_NEUTRAL for v in self._rc.values()):
+                self._deadman_until = 0.0
 
     # Stop RC thread
     def stop_rc_override(self):
@@ -136,13 +235,9 @@ class MovementController:
     def takeoff(self, altitude_m: float) -> dict:
         self.clear_cancel()
 
-        res = self._switch_mode("LOITER")
+        res = self._switch_mode(CORR_MODE)
         if not res["ok"]:
             return res
-
-        # hover_thrust = self._get_hover_thrust()
-        # climb_thrust = hover_thrust + 0.08
-        # print(f"[MC] takeoff: hover={hover_thrust:.4f} climb={climb_thrust:.4f}")
 
         res = self._arm()
         if not res["ok"]:
@@ -153,157 +248,81 @@ class MovementController:
         start = time.time()
         while True:
             if self._cancel.is_set():
+                self.rc_hold()
                 return self._fail("Takeoff cancelled")
-            if time.time() - start > 30:
+
+            if time.time() - start > TAKEOFF_TIMEOUT_S:
+                self.rc_hold()
                 self._v.mode = VehicleMode("LAND")
-                return self._fail("Takeoff timed out after 30s")
+                return self._fail(
+                    f"Takeoff timed out after {TAKEOFF_TIMEOUT_S:.0f}s")
 
             rf_dist = self._v.rangefinder.distance
             if rf_dist is None:
+                self.rc_hold()
                 self._v.mode = VehicleMode("LAND")
-                return self._fail("Rangefinder not ready (None) — aborting takeoff")
+                return self._fail(
+                    "Rangefinder not ready (None) — aborting takeoff")
 
             current_alt = float(rf_dist)
-            # self._send_attitude_thrust(climb_thrust)
-            print(f"[MC] alt {current_alt:.2f}/{altitude_m:.2f}m")
+            err = altitude_m - current_alt
 
-            if current_alt >= altitude_m * 0.90:
-                print("[MC] Target altitude reached, settling…")
-                self.rc_hold()
+            if err <= TAKEOFF_ARRIVE_M:
                 break
 
+            # Proportional climb-rate demand: full offset while far from the
+            # target, tapering to zero on arrival.
+            offset = int(max(0, min(TAKEOFF_THR_MAX_OFFSET,
+                                    TAKEOFF_THR_KP * err)))
+            self.set_rc(throttle=RC_NEUTRAL + offset)
+            print(f"[MC] alt {current_alt:.2f}/{altitude_m:.2f}m  thr+{offset}")
+            time.sleep(TAKEOFF_LOOP_PERIOD)
 
-            self.set_rc(throttle=1650)  # climb
-            time.sleep(0.1)
-
-        return {"ok": True, "message": f"Takeoff to {altitude_m}m complete"}
-
-    def move(self, north_m=0.0, east_m=0.0, down_m=0.0, speed=0.3) -> dict:
-        self.clear_cancel()
-
-        res = self._switch_mode("LOITER")
-        if not res["ok"]:
-            return res
-
-        try:
-            local = self._v.location.local_frame
-            if local.north is None:
-                return self._fail("EKF not ready: local_frame.north is None")
-            # Rotate body-relative offset by current yaw so "forward" = drone nose
-            yaw = self._v.attitude.yaw  # radians, 0=North, +CW
-            rotated_n = north_m * math.cos(yaw) - east_m * math.sin(yaw)
-            rotated_e = north_m * math.sin(yaw) + east_m * math.cos(yaw)
-            target_n = local.north + rotated_n
-            target_e = local.east  + rotated_e
-            target_d = local.down  - down_m  # down axis inverted
-        except Exception as e:
-            return self._fail(f"Could not read local frame: {e}")
-
-        print(f"[MC] move target NED: ({target_n:.2f}, {target_e:.2f}, {target_d:.2f})"
-              f" (yaw={math.degrees(yaw):.1f}°)")
-
-        start = time.time()
-        ok_count = 0
-
-        while True:
+        # Neutral throttle and let the altitude controller absorb the residual
+        # climb rate before reporting success.
+        print(f"[MC] Target reached, settling {TAKEOFF_SETTLE_S:.0f}s…")
+        self.rc_hold()
+        settle_start = time.time()
+        while time.time() - settle_start < TAKEOFF_SETTLE_S:
             if self._cancel.is_set():
-                self._send_stop()
-                return self._fail("Move cancelled")
-
-            if time.time() - start > 20:
-                self._send_stop()
-                return self._fail("Move timed out after 20s")
-
-            self._send_position_target_ned(target_n, target_e, target_d)
-
-            try:
-                local = self._v.location.local_frame
-                pos_error = math.sqrt(
-                    (local.north - target_n) ** 2 +
-                    (local.east  - target_e) ** 2 +
-                    (local.down  - target_d) ** 2
-                )
-                v = self._v.velocity
-                spd = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
-            except Exception:
-                ok_count = 0
-                time.sleep(0.1)
-                continue
-
-            if pos_error < 0.15 and spd < 0.10:
-                ok_count += 1
-            else:
-                ok_count = 0
-
-            if ok_count >= 10:
-                print("[MC] Move complete (converged)")
-                return {"ok": True, "message": "Move complete"}
-
+                return self._fail("Takeoff cancelled during settle")
             time.sleep(0.1)
 
-    def yaw(self, degrees: float, clockwise: bool = True,
-            speed_dps: float = 30) -> dict:
-        self.clear_cancel()
-
-        res = self._switch_mode("GUIDED")
-        if not res["ok"]:
-            return res
-
-        direction = 1 if clockwise else -1
-        msg = self._v.message_factory.command_long_encode(
-            0, 0,
-            mavutil.mavlink.MAV_CMD_CONDITION_YAW,
-            0,
-            degrees,
-            speed_dps,
-            direction,
-            1,      # relative
-            0, 0, 0
-        )
-        self._v.send_mavlink(msg)
-
         try:
-            start_yaw = math.degrees(self._v.attitude.yaw)
+            final_alt = float(self._v.rangefinder.distance)
+            settled = f" (settled at {final_alt:.2f}m)"
         except Exception:
-            start_yaw = 0.0
+            settled = ""
+        print(f"[MC] Takeoff complete{settled}")
+        return {"ok": True,
+                "message": f"Takeoff to {altitude_m}m complete{settled}"}
 
-        timeout = (degrees / speed_dps) + 5
-        start = time.time()
-        ok_count = 0
-
-        while True:
-            if self._cancel.is_set():
-                return self._fail("Yaw cancelled")
-            if time.time() - start > timeout:
-                return self._fail(f"Yaw timed out after {timeout:.1f}s")
-
-            try:
-                current_yaw = math.degrees(self._v.attitude.yaw)
-                target_yaw  = start_yaw + degrees * direction
-                error = abs((target_yaw - current_yaw + 180) % 360 - 180)
-            except Exception:
-                ok_count = 0
-                time.sleep(0.1)
-                continue
-
-            if error < 5:
-                ok_count += 1
-            else:
-                ok_count = 0
-
-            if ok_count >= 5:
-                print("[MC] Yaw complete")
-                return {"ok": True, "message": f"Yaw {degrees}° complete"}
-
-            time.sleep(0.1)
+    # NOTE: move() and yaw() were removed on 2026-08-07.
+    #
+    # Both were GUIDED-mode implementations left over from the abandoned
+    # migration (see new_changes/to_guided/). move() streamed
+    # SET_POSITION_TARGET_LOCAL_NED while switching the vehicle to LOITER —
+    # ArduCopter only honours those setpoints in GUIDED, so the packets were
+    # discarded and the call always ran to its 20s timeout before returning.
+    # It was also gated behind an "EKF not ready" check that never passes
+    # indoors without GPS. yaw() used MAV_CMD_CONDITION_YAW and forced GUIDED,
+    # which fought the 20Hz RC override stream.
+    #
+    # Directional control is RC-only now: set_rc() / rc_hold() driven by
+    # DIR_MAP in new_api_server_1.py, including yaw_left / yaw_right.
+    # Closed-loop RC-based move/yaw primitives are the next step.
 
     def hold(self) -> dict:
+        """
+        Stop all movement: centre every channel, stay in the current mode.
+
+        Previously this sent a BODY_NED zero-velocity setpoint and forced
+        GUIDED. The setpoint was ignored outside GUIDED, and the mode switch
+        pulled the aircraft out of the mode the RC stream targets.
+        """
         self._cancel.set()
-        time.sleep(0.05)
-        self._send_stop()
-        if self._v.mode.name != "GUIDED":
-            self._switch_mode("GUIDED")
-        return self._success("Holding position")
+        self.rc_hold()
+        return self._success("Holding — all channels centred")
 
     def land(self) -> dict:
         self.cancel()
@@ -340,16 +359,6 @@ class MovementController:
 
     # ── Private helpers ───────────────────────────────────────────────
 
-    def _get_hover_thrust(self) -> float:
-        try:
-            val = float(self._v.parameters['MOT_THST_HOVER'])
-            if 0.1 < val < 0.95:
-                return val
-        except Exception:
-            pass
-        print("[MC] MOT_THST_HOVER read failed, using fallback 0.68")
-        return 0.68
-
     def _switch_mode(self, mode_name: str) -> dict:
         try:
             self._v.mode = VehicleMode(mode_name)
@@ -375,41 +384,6 @@ class MovementController:
             return self._success("Armed")
         except Exception as e:
             return self._fail(str(e))
-
-    def _send_attitude_thrust(self, thrust: float):
-        msg = self._v.message_factory.set_attitude_target_encode(
-            0,
-            1, 1,
-            0b00000111,
-            [1, 0, 0, 0],
-            0, 0, 0,
-            thrust
-        )
-        self._v.send_mavlink(msg)
-
-    def _send_position_target_ned(self, n: float, e: float, d: float):
-        msg = self._v.message_factory.set_position_target_local_ned_encode(
-            0, 0, 0,
-            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0b0000111111111000,  # position only
-            n, e, d,
-            0, 0, 0,
-            0, 0, 0,
-            0, 0
-        )
-        self._v.send_mavlink(msg)
-
-    def _send_stop(self):
-        msg = self._v.message_factory.set_position_target_local_ned_encode(
-            0, 0, 0,
-            mavutil.mavlink.MAV_FRAME_BODY_NED,
-            0b0000111111000111,  # velocity only, all zeros
-            0, 0, 0,
-            0, 0, 0,
-            0, 0, 0,
-            0, 0
-        )
-        self._v.send_mavlink(msg)
 
     def _fail(self, reason: str) -> dict:
         print(f"[MC] FAIL: {reason}")

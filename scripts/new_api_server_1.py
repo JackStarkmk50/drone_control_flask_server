@@ -13,9 +13,22 @@ import threading
 import time
 import cv2
 import subprocess
-from scripts.webrtc.routes import bp as webrtc_bp
+# WebRTC is optional: import failure must not take the whole server down.
+# This was `from scripts.webrtc.routes import bp` — but the service runs
+# `python3 /home/pi/drone/scripts/new_api_server_1.py`, so sys.path[0] is the
+# scripts/ directory itself and there is no importable `scripts` package.
+# `webrtc` is the correct top-level name from there. aiortc is also missing
+# from requirements.txt, so a clean venv fails on that instead.
+try:
+    from webrtc.routes import bp as webrtc_bp
+    WEBRTC_AVAILABLE = True
+    WEBRTC_ERROR = None
+except Exception as _e:            # ImportError, or aiortc/av not installed
+    webrtc_bp = None
+    WEBRTC_AVAILABLE = False
+    WEBRTC_ERROR = f"{type(_e).__name__}: {_e}"
 
-from movement_controller import MovementController
+from movement_controller import MovementController, CORR_RATE_HZ, RC_RATE_HZ
 from mission_manager import MissionManager
 
 def scan_networks():
@@ -174,10 +187,14 @@ app = Flask(__name__,
 
 CORS(app)  # handles OPTIONS preflight responses
 
-app.register_blueprint(
-    webrtc_bp,
-    url_prefix="/webrtc"
-)
+if WEBRTC_AVAILABLE:
+    app.register_blueprint(
+        webrtc_bp,
+        url_prefix="/webrtc"      # routes declare /connect -> /webrtc/connect
+    )
+    print("[webrtc] blueprint registered at /webrtc")
+else:
+    print(f"[webrtc] DISABLED — {WEBRTC_ERROR}")
 
 @app.after_request
 def add_cors_headers(response):
@@ -282,6 +299,32 @@ PID_GROUPS = {
     },
 }
 
+# ===== Serial link =====
+# Must match SERIAL2_BAUD on the flight controller (57 = 57600, 921 = 921600).
+# Change BOTH sides or the link drops. At 57600 the usable inbound budget is
+# ~5.7 kB/s, which is what caps the stream rates below.
+SERIAL_BAUD = 57600
+
+# ===== MAVLink stream rates =====
+# ATTITUDE must exceed the fastest consumer loop — the 20 Hz correction loop in
+# movement_controller. SR1_*/SR2_* are all 0 in mav.parm, so the runtime
+# request in _configure_streams() is the only thing streaming it at all.
+#
+# EXTRA3 carries rangefinder (takeoff altitude, read at 10 Hz), vibration,
+# battery, EKF status and OPTICAL_FLOW — so it is the stream to raise if the
+# correction loop is ever moved onto flow velocity instead of attitude.
+_HIGH_BAUD = SERIAL_BAUD >= 115200
+ATTITUDE_RATE_HZ = 50 if _HIGH_BAUD else 30
+EXTRA3_RATE_HZ   = 30 if _HIGH_BAUD else 10
+POSITION_RATE_HZ = 10 if _HIGH_BAUD else 5
+
+# ===== RC deadman windows (seconds) =====
+# Socket clients heartbeat while a button is held, so the window can be tight.
+# The HTTP path has no heartbeat, so it gets a longer backstop — enough for a
+# manual curl test, short enough that a lost client cannot latch a command.
+RC_DEADMAN_SOCKET_S = 0.5
+RC_DEADMAN_HTTP_S   = 3.0
+
 # ===== RC OverRide Config =====
 DIR_MAP = {
     "forward":       ("pitch",    1350),
@@ -295,19 +338,96 @@ DIR_MAP = {
 }
 
 
+# ─── MAVLink stream rates ────────────────
+def _configure_streams(veh):
+    """
+    Request per-stream MAVLink rates from the flight controller.
+
+    DroneKit's connect(rate=N) sends a single MAV_DATA_STREAM_ALL request, i.e.
+    "send me every stream at N Hz". At 57600 baud (~5.76 kB/s) that saturates
+    the link well before 30 Hz — the FCU then drops and delays messages, and
+    ATTITUDE arrives late along with everything else. Asking per-stream keeps
+    the one rate that matters high and everything else cheap.
+
+    What each stream actually carries on ArduCopter, and which DroneKit
+    attribute it feeds:
+
+      EXTRA1   ATTITUDE, AHRS2, PID_TUNING
+               -> vehicle.attitude  (pitch/roll/yaw — the correction loop)
+      EXTRA2   VFR_HUD
+               -> vehicle.groundspeed, vehicle.airspeed, heading
+      EXTRA3   RANGEFINDER, DISTANCE_SENSOR, OPTICAL_FLOW, VIBRATION,
+               BATTERY_STATUS, EKF_STATUS_REPORT, AHRS, HWSTATUS, SYSTEM_TIME
+               -> vehicle.rangefinder (takeoff altitude), vehicle.vibration,
+                  vehicle.ekf_ok, battery detail. Heaviest stream by far.
+      POSITION GLOBAL_POSITION_INT, LOCAL_POSITION_NED
+               -> vehicle.location.*, vehicle.velocity
+      EXT_STAT SYS_STATUS, POWER_STATUS, MEMINFO, MISSION_CURRENT,
+               GPS_RAW_INT, NAV_CONTROLLER_OUTPUT, FENCE_STATUS
+               -> vehicle.battery (voltage/current), vehicle.gps_0
+      RC_CHAN  RC_CHANNELS, SERVO_OUTPUT_RAW
+               -> useful for verifying overrides land; cheap to keep low
+      RAW_SENS RAW_IMU, SCALED_IMU2/3, SCALED_PRESSURE*
+               -> unused here, and expensive. Off.
+
+    vehicle.mode / vehicle.armed come from HEARTBEAT, which is always sent at
+    1 Hz regardless of these settings.
+
+    Rough inbound budget at 57600 (~5.7 kB/s usable):
+        EXTRA1   30 Hz  ~1080 B/s
+        EXTRA3   10 Hz  ~1200 B/s
+        POSITION  5 Hz   ~350 B/s
+        EXT_STAT  2 Hz   ~300 B/s
+        EXTRA2    4 Hz   ~112 B/s
+        RC_CHAN   2 Hz    ~80 B/s
+        ------------------------------------
+        total         ~3.1 kB/s   (~55% of link)
+
+    The outbound RC override stream does not compete with this — serial is full
+    duplex, so TX and RX have independent budgets.
+    """
+    streams = [
+        (mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,          ATTITUDE_RATE_HZ),
+        (mavutil.mavlink.MAV_DATA_STREAM_EXTRA3,          EXTRA3_RATE_HZ),
+        (mavutil.mavlink.MAV_DATA_STREAM_POSITION,        POSITION_RATE_HZ),
+        (mavutil.mavlink.MAV_DATA_STREAM_EXTRA2,          4),
+        (mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS, 2),
+        (mavutil.mavlink.MAV_DATA_STREAM_RC_CHANNELS,     2),
+        (mavutil.mavlink.MAV_DATA_STREAM_RAW_SENSORS,     0),
+    ]
+    for stream_id, rate in streams:
+        try:
+            veh._master.mav.request_data_stream_send(
+                veh._master.target_system,
+                veh._master.target_component,
+                stream_id,
+                int(rate),
+                1 if rate > 0 else 0     # start / stop
+            )
+        except Exception as e:
+            print(f"[stream] request id={stream_id} @{rate}Hz failed: {e}")
+    print(f"[stream] configured @{SERIAL_BAUD} baud — "
+          f"ATTITUDE {ATTITUDE_RATE_HZ}Hz, EXTRA3 {EXTRA3_RATE_HZ}Hz "
+          f"(correction loop {CORR_RATE_HZ}Hz, RC out {RC_RATE_HZ}Hz)")
+
+
 # ─── Connect Drone ───────────────────────
 def connect_drone():
     global vehicle, mc, mm
     print("Connecting to Pixhawk...")
     vehicle = connect(
         '/dev/ttyAMA0',
-        baud=57600,
+        baud=SERIAL_BAUD,
         wait_ready=False
     )
     print("Drone connected!")
+    _configure_streams(vehicle)
     print("Speed params set: WPNAV_SPEED=30 UP=30 DN=30 cm/s")
     mc = MovementController(vehicle)
-    mm = MissionManager(vehicle)
+    # Share the controller — mm must drive the same instance whose RC sender
+    # and correction threads are started below, otherwise mission commands go
+    # into a dict nothing transmits.
+    mm = MissionManager(vehicle, mc)
     print("MovementController and MissionManager initialised.")
     mc.start_rc_override()  # ← start on connect
     print("RC override thread started.")
@@ -432,38 +552,10 @@ def get_status_data():
         "vibe_z":        vibe_z,
     }
 
-def send_stop():
-    msg = vehicle.message_factory\
-        .set_position_target_local_ned_encode(
-        0, 0, 0,
-        mavutil.mavlink.MAV_FRAME_BODY_NED,
-        0b0000111111000111,
-        0, 0, 0,
-        0, 0, 0,
-        0, 0, 0,
-        0, 0)
-    vehicle.send_mavlink(msg)
-
-def send_yaw(heading, speed, direction, relative):
-    msg = vehicle.message_factory\
-        .command_long_encode(
-        0, 0,
-        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
-        0,
-        heading,   # degrees
-        speed,     # speed deg/s
-        direction, # 1=CW -1=CCW
-        relative,  # 1=relative 0=absolute
-        0, 0, 0
-    )
-    vehicle.send_mavlink(msg)
-
-def _send_yaw_locked(heading, speed, direction, relative):
-    """Wrapper that releases _cmd_lock after send_yaw completes."""
-    try:
-        send_yaw(heading, speed, direction, relative)
-    finally:
-        _cmd_lock.release()
+# send_stop(), send_yaw() and _send_yaw_locked() were removed on 2026-08-07.
+# They were module-level GUIDED-mode senders (BODY_NED zero-velocity and
+# MAV_CMD_CONDITION_YAW) with no callers anywhere — duplicates of the
+# MovementController methods deleted in the same pass.
 
 # ─── Telemetry Stream ────────────────────
 def stream_telemetry():
@@ -797,104 +889,20 @@ def rtl():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
+# /move and /yaw were removed on 2026-08-07 along with the GUIDED-mode
+# primitives they called. Both are answered explicitly rather than 404'd so an
+# old client (or an LLM working from stale docs) gets a usable pointer.
 @app.route('/move', methods=['POST'])
-def move():
-    if not vehicle:
-        return _no_vehicle()
-    if not _cmd_lock.acquire(blocking=False):
-        return jsonify({"success": False, "message": "Another command is in progress"}), 409
-
-    try:
-        data      = request.json or {}
-        direction = data.get('direction')
-        distance  = float(data.get('distance', 1))
-        speed     = float(data.get('speed', 0.3))
-
-        allowed = ['forward', 'backward', 'left', 'right', 'up', 'down']
-
-        if direction not in allowed:
-            _cmd_lock.release()
-            return jsonify({"success": False, "message": f"Direction must be one of {allowed}"}), 400
-
-        if speed < 0.2 or speed > 0.3:
-            _cmd_lock.release()
-            return jsonify({"success": False, "message": "Speed must be 0.2–0.3 m/s (indoor AI limit)"}), 400
-
-        if not vehicle.armed:
-            _cmd_lock.release()
-            return jsonify({"success": False, "message": "Drone not armed — takeoff first"}), 400
-
-        direction_to_mc = {
-            'forward':  lambda: mc.move(north_m=distance,  speed=speed),
-            'backward': lambda: mc.move(north_m=-distance, speed=speed),
-            'left':     lambda: mc.move(east_m=-distance,  speed=speed),
-            'right':    lambda: mc.move(east_m=distance,   speed=speed),
-            'up':       lambda: mc.move(down_m=distance,   speed=speed),
-            'down':     lambda: mc.move(down_m=-distance,  speed=speed),
-        }
-
-        move_fn = direction_to_mc[direction]
-
-        def _move_worker():
-            try:
-                move_fn()
-            finally:
-                _cmd_lock.release()
-
-        thread = threading.Thread(target=_move_worker, daemon=True)
-        thread.start()
-
-        return jsonify({
-            "success":   True,
-            "message":   f"Moving {direction} {distance}m at {speed}m/s",
-            "direction": direction,
-            "distance":  distance,
-            "speed":     speed,
-        })
-    except Exception as e:
-        _cmd_lock.release()
-        return jsonify({"success": False, "message": str(e)}), 500
-
 @app.route('/yaw', methods=['POST'])
-def yaw():
-    if not vehicle:
-        return _no_vehicle()
-    if not _cmd_lock.acquire(blocking=False):
-        return jsonify({"success": False, "message": "Another command is in progress"}), 409
-
-    try:
-        data      = request.json or {}
-        direction = data.get('direction', 'right')
-        degrees   = float(data.get('degrees', 90))
-        speed     = float(data.get('speed', 30))
-
-        if direction not in ['left', 'right']:
-            _cmd_lock.release()
-            return jsonify({"success": False, "message": "Direction must be left or right"}), 400
-
-        if degrees > 360:
-            _cmd_lock.release()
-            return jsonify({"success": False, "message": "Max rotation is 360 degrees"}), 400
-
-        def _yaw_worker():
-            try:
-                mc.yaw(degrees, clockwise=(direction == 'right'), speed_dps=speed)
-            finally:
-                _cmd_lock.release()
-
-        thread = threading.Thread(target=_yaw_worker, daemon=True)
-        thread.start()
-
-        return jsonify({
-            "success":   True,
-            "message":   f"Yawing {direction} {degrees} degrees",
-            "direction": direction,
-            "degrees":   degrees,
-            "speed":     speed,
-        })
-    except Exception as e:
-        _cmd_lock.release()
-        return jsonify({"success": False, "message": str(e)}), 500
+def _removed_guided_motion():
+    return jsonify({
+        "success": False,
+        "message": ("Removed — these used GUIDED-mode setpoints, which this "
+                    "airframe does not fly. Use POST /rc or the 'rc' socket "
+                    "event with a direction from DIR_MAP."),
+        "use_instead": "/rc",
+        "directions": sorted(DIR_MAP.keys()),
+    }), 410
 
 @app.route('/mode', methods=['POST'])
 def set_mode():
@@ -1276,49 +1284,63 @@ def queue_clear():
 
 # RC control endpoint
 
-@app.route('/rc', methods=['POST'])
-def rc():
-    if not vehicle: return _no_vehicle()
-    data    = request.json or {}
-    action  = data.get("action","move")
+def _rc_apply(data, deadman_s):
+    """
+    Shared RC handler for both the HTTP endpoint and the Socket.IO event.
+
+    Returns (payload_dict, http_status). Socket callers ignore the status.
+
+    deadman_s is how long a non-neutral command stays valid without a refresh.
+    Every 'move' refreshes it; when it expires, movement_controller centres all
+    channels. Pass 0 to disable (bench testing only — a dropped client will then
+    leave the command latched, which is the pre-2026-08-07 behaviour).
+    """
+    if not vehicle or mc is None:
+        return {"success": False, "message": "Drone not connected"}, 503
+
+    action = data.get("action", "move")
 
     if action == "start":
         mc.start_rc_override()
-        return jsonify({"success":True,
-                        "message":"RC started"})
+        return {"success": True, "message": "RC started"}, 200
 
-    # if action == "stop":
-    #     mc.stop_rc_override()
-    #     return jsonify({"success":True,
-    #                     "message":"RC stopped"})
+    if action == "stop":
+        mc.stop_rc_override()
+        return {"success": True, "message": "RC stopped"}, 200
 
     if action == "hold":
         mc.rc_hold()
-        return jsonify({"success":True,
-                        "message":"Holding"})
+        return {"success": True, "message": "Holding"}, 200
 
     if action == "move":
         direction = data.get("direction")
         release   = data.get("release", False)
 
         if direction not in DIR_MAP:
-            return jsonify({"success":False,
-                "message":f"Unknown: {direction}"}), 400
+            return {"success": False,
+                    "message": f"Unknown: {direction}"}, 400
 
         channel, default = DIR_MAP[direction]
 
         if release:
             mc.rc_hold(channel)
-            return jsonify({"success":True,
-                "message":f"{direction} released"})
+            return {"success": True,
+                    "message": f"{direction} released"}, 200
 
         value = int(data.get("value", default))
         mc.set_rc(**{channel: value})
-        return jsonify({"success":True,
-            "message":f"{direction}={value}"})
+        # Arm/refresh the deadman AFTER the command lands.
+        mc.touch_deadman(data.get("deadman", deadman_s))
+        return {"success": True,
+                "message": f"{direction}={value}"}, 200
 
-    return jsonify({"success":False,
-        "message":"Unknown action"}), 400
+    return {"success": False, "message": "Unknown action"}, 400
+
+
+@app.route('/rc', methods=['POST'])
+def rc():
+    payload, status = _rc_apply(request.json or {}, RC_DEADMAN_HTTP_S)
+    return jsonify(payload), status
 
 # WebRTC endpoint
 
@@ -1341,6 +1363,28 @@ def on_connect():
 @socketio.on('disconnect')
 def on_disconnect():
     print("Client disconnected!")
+    # A client that vanishes mid-hold must not leave a stick latched. The
+    # deadman would catch this within RC_DEADMAN_SOCKET_S anyway; centring here
+    # makes it immediate.
+    try:
+        if mc is not None:
+            mc.rc_hold()
+            print("[rc] client gone — channels centred")
+    except Exception as e:
+        print(f"[rc] centre-on-disconnect failed: {e}")
+
+
+# ─── RC over Socket.IO ───────────────────────────────────────────
+# Same payload shape as POST /rc, but over the already-open websocket:
+# no per-command TCP/TLS setup, no ngrok HTTP round trip. Roughly 100ms
+# faster per input. POST /rc still works and is unchanged.
+#
+# Clients MUST re-emit 'rc' with the same direction every ~200ms while a
+# button is held. That heartbeat is what keeps the deadman fed.
+@socketio.on('rc')
+def on_rc(data):
+    payload, _ = _rc_apply(data or {}, RC_DEADMAN_SOCKET_S)
+    return payload          # delivered to the client's ack callback
 
 # ─── Main ────────────────────────────────
 if __name__ == '__main__':
@@ -1382,18 +1426,30 @@ if __name__ == '__main__':
     print("POST /land")
     print("POST /rtl")
     print("POST /hold")
-    print("POST /move           {direction, distance, speed}")
-    print("POST /yaw            {direction, degrees, speed}")
     print("POST /mode           {mode}")
     print("GET  /param?name=X")
     print("POST /param          {param, value}")
     print("POST /emergency")
-    print("GET  /video_feed")
+    print("")
+    print("RC (the control path):")
+    print("POST /rc             {action: start|stop|hold|move, direction, release}")
+    print("  socket 'rc'        same payload, ~100ms faster — preferred")
+    print(f"  directions:        {', '.join(sorted(DIR_MAP.keys()))}")
+    print(f"  deadman:           socket {RC_DEADMAN_SOCKET_S}s / http {RC_DEADMAN_HTTP_S}s")
+    print("")
+    print("POST /mission        {steps:[{cmd:takeoff|land|hold|hover, ...}]}")
+    print("GET  /mission/status")
+    print("POST /mission/cancel")
+    print("GET  /camera/stream  (MJPEG)")
     print("POST /camera/start")
     print("POST /camera/stop")
-    print("POST /queue/add      {action, params}")
+    print("GET  /network/scan")
+    print("POST /network/connect {ssid, password}")
+    print("POST /queue/add      {action, params}   (not drained — no-op)")
     print("GET  /queue/status")
     print("POST /queue/clear")
+    print("")
+    print("GONE: /move, /yaw  -> 410, use /rc (GUIDED-mode, removed)")
     socketio.run(
         app,
         host='0.0.0.0',
