@@ -1,1 +1,18 @@
 __pycache__/
+logs/
+config/
+
+# Flight tracker output — recorded on the aircraft, not source.
+# flights.db grows ~700 KB per 10-min flight; video/ grows ~60 MB per 10 min.
+flights/
+*.db
+*.db-wal
+*.db-shm
+
+# MAVLink capture logs (large, regenerated every session)
+*.tlog
+*.tlog.raw
+
+# Editor / shell leftovers
+*.swp
+*.save

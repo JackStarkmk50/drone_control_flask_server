@@ -31,6 +31,20 @@ except Exception as _e:            # ImportError, or aiortc/av not installed
 from movement_controller import MovementController, CORR_RATE_HZ, RC_RATE_HZ
 from mission_manager import MissionManager
 
+# Flight tracker is optional for the same reason WebRTC is: a missing dependency
+# or a corrupt DB must not stop the aircraft's control server from starting.
+try:
+    from flight_tracker import FlightTracker, FrameHub, SAMPLE_HZ as TRACK_HZ
+    from flight_tracker.routes import make_blueprint as make_flights_bp
+    TRACKER_AVAILABLE = True
+    TRACKER_ERROR = None
+except Exception as _e:
+    FlightTracker = None
+    FrameHub = None
+    TRACK_HZ = 0
+    TRACKER_AVAILABLE = False
+    TRACKER_ERROR = f"{type(_e).__name__}: {_e}"
+
 def scan_networks():
     print("Triggering Wi-Fi environment rescan...")
     subprocess.run(
@@ -181,6 +195,26 @@ camera_active      = False
 CAMERA_FPS         = 10
 CAMERA_JPEG_QUALITY = 70   # 70% quality: fine for live stream, ~40% smaller than default
 
+# Exactly one thread may call camera.read() — read() CONSUMES a frame, so two
+# readers split the stream between them and both run at half rate. The hub owns
+# that single read and hands the latest frame to every consumer (the MJPEG
+# generator, the flight video recorder, and any additional stream viewers).
+def _hub_read():
+    with camera_lock:
+        cap = camera
+    if cap is None:
+        return False, None
+    return cap.read()
+
+
+frame_hub = FrameHub(_hub_read, fps=CAMERA_FPS) if TRACKER_AVAILABLE else None
+
+# ─── Flight Tracker Paths ────────────────
+# scripts/../flights/  →  /home/pi/drone/flights/
+FLIGHTS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'flights')
+FLIGHTS_DB    = os.path.join(FLIGHTS_DIR, 'flights.db')
+FLIGHTS_VIDEO = os.path.join(FLIGHTS_DIR, 'video')
+
 app = Flask(__name__,
             template_folder='../templates',
             static_folder='../static')
@@ -207,6 +241,30 @@ socketio = SocketIO(
     cors_allowed_origins="*",
     async_mode='threading'
 )
+
+# ─── Flight Tracker ──────────────────────
+# Created after socketio so it can push live 'track_point' / 'flight_started' /
+# 'flight_ended' events. It is PASSIVE: it reads the vehicle and the
+# MovementController and never writes to either, so it cannot affect flight.
+tracker = None
+if TRACKER_AVAILABLE:
+    try:
+        tracker = FlightTracker(
+            db_path=FLIGHTS_DB,
+            video_dir=FLIGHTS_VIDEO,
+            socketio=socketio,
+            record_video=True,
+            video_fps=CAMERA_FPS,
+        )
+        app.register_blueprint(make_flights_bp(tracker), url_prefix="/flights")
+        print(f"[tracker] blueprint registered at /flights  (db: {FLIGHTS_DB})")
+    except Exception as _e:
+        tracker = None
+        TRACKER_AVAILABLE = False
+        TRACKER_ERROR = f"{type(_e).__name__}: {_e}"
+        print(f"[tracker] DISABLED — {TRACKER_ERROR}")
+else:
+    print(f"[tracker] DISABLED — {TRACKER_ERROR}")
 
 # ─── Global State ────────────────────────
 vehicle = None
@@ -433,6 +491,14 @@ def connect_drone():
     print("RC override thread started.")
     mc.start_correction_loop()  # ← start on connect for the correction loop
 
+    # Flight tracker: watches the armed edge and records one flight per arm.
+    if tracker is not None:
+        try:
+            tracker.attach(vehicle, mc, frame_hub, start_camera)
+            tracker.start()
+        except Exception as e:
+            print(f"[tracker] failed to start: {type(e).__name__}: {e}")
+
 # ─── Safe Value Helpers ──────────────────
 # FIX 2: DroneKit fields can return None; these prevent TypeError crashes.
 
@@ -600,6 +666,9 @@ def start_camera():
                 camera        = cap
                 camera_active = True
                 print("Camera started")
+                if frame_hub is not None and not frame_hub.running:
+                    frame_hub.start()
+                    print("[framehub] grabber started")
             else:
                 cap.release()
                 print("Failed to start camera")
@@ -607,12 +676,22 @@ def start_camera():
 def stop_camera():
     global camera, camera_active
 
+    # A flight video recording is reading through the hub. Releasing the
+    # capture underneath it would truncate the recording, so refuse.
+    if tracker is not None and tracker.status().get("video_active"):
+        print("Camera stop refused: flight video recording in progress")
+        return False
+
+    if frame_hub is not None and frame_hub.running:
+        frame_hub.stop()
+
     with camera_lock:
         if camera is not None:
             camera.release()
             camera      = None
             camera_active = False
             print("Camera stopped")
+    return True
 
 def generate_frames():
     print("[Cam] Generator Started")
@@ -620,17 +699,24 @@ def generate_frames():
 
     error_count = 0
     max_errors  = 10  # stop stream after 10 consecutive read failures
+    seq         = 0   # last frame sequence this viewer has sent
 
     while camera_active:
-    
-        # Grab local reference under lock — prevents crash if stop_camera() runs concurrently
-        with camera_lock:
-            cap = camera
 
-        if cap is None:
-            break
-
-        success, frame = cap.read()
+        if frame_hub is not None:
+            # Hub path: one grabber thread owns cap.read(), viewers take the
+            # latest frame. Two browser tabs no longer halve each other's rate,
+            # and the flight video recorder can share the same frames.
+            seq, frame, _ = frame_hub.wait_for_new(seq, timeout=2.0)
+            success = frame is not None
+        else:
+            # Fallback when the tracker package is unavailable — original
+            # behaviour, one reader straight off the capture.
+            with camera_lock:
+                cap = camera
+            if cap is None:
+                break
+            success, frame = cap.read()
 
         if not success:
             error_count += 1
@@ -656,11 +742,31 @@ def generate_frames():
             b'\r\n'
         )
 
-        socketio.sleep(1.0 / CAMERA_FPS)  # pace to actual camera FPS
+        if frame_hub is None:
+            socketio.sleep(1.0 / CAMERA_FPS)  # pace to actual camera FPS
+        else:
+            # wait_for_new() already blocks until the grabber produces a frame,
+            # so the hub sets the pace. Sleeping again here would skip every
+            # second frame and halve the stream rate.
+            socketio.sleep(0)
 
 # ─── Guard Helpers ───────────────────────
 def _no_vehicle():
     return jsonify({"success": False, "message": "Drone not connected"}), 503
+
+
+def _mark(kind, detail=None):
+    """
+    Drop a marker on the recording flight's timeline. No-op when nothing is
+    recording. Wrapped so a tracker fault can never propagate into a flight
+    command's response path.
+    """
+    if tracker is None:
+        return
+    try:
+        tracker.mark(kind, detail)
+    except Exception:
+        pass
 
 # ─── Routes ──────────────────────────────
 
@@ -694,6 +800,7 @@ def health():
             "battery":       safe_round(vehicle.battery.voltage, 1) if vehicle.battery else 0.0,
             "gps_fix":       safe_int(vehicle.gps_0.fix_type) if vehicle.gps_0 else 0,
             "system_status": sys_status,
+            "tracker":       tracker.status() if tracker else {"available": False},
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -844,9 +951,12 @@ def takeoff():
             _cmd_lock.release()
             return jsonify({"success": False, "message": "Min altitude is 0.5m"}), 400
 
+        _mark("takeoff", f"target {altitude}m")
+
         def _takeoff_worker():
             try:
-                mc.takeoff(altitude)
+                res = mc.takeoff(altitude)
+                _mark("takeoff_done", (res or {}).get("message"))
             finally:
                 _cmd_lock.release()
 
@@ -870,6 +980,7 @@ def land():
     try:
         _takeoff_cancelled = True
         vehicle.mode = VehicleMode("LAND")
+        _mark("land")
         return jsonify({"success": True, "message": "Landing"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -885,6 +996,7 @@ def rtl():
             return jsonify({"success": False, "message": "No GPS fix for RTL"}), 400
         _takeoff_cancelled = True
         vehicle.mode = VehicleMode("RTL")
+        _mark("rtl")
         return jsonify({"success": True, "message": "Returning to launch"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -983,6 +1095,7 @@ def emergency():
         _takeoff_cancelled = True
         _motion_cancelled  = True
         mc.emergency_stop()
+        _mark("emergency")
         return jsonify({"success": True, "message": "Emergency stop executed"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1001,6 +1114,7 @@ def mission_start():
         if not steps:
             return jsonify({"success": False, "message": "steps list required"}), 400
         mm.run_mission(steps, blocking=False)
+        _mark("mission", ",".join(str(s.get("cmd")) for s in steps))
         return jsonify({"success": True, "message": "Mission started", "steps": len(steps)})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1036,7 +1150,11 @@ def camera_on():
 @app.route('/camera/stop', methods=['GET', 'POST'])
 def camera_off():
     try:
-        stop_camera()
+        if not stop_camera():
+            return jsonify({
+                "success": False,
+                "message": "Flight video recording in progress — camera kept on"
+            }), 409
         return jsonify({"success": True, "message": "Camera stopped"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1360,6 +1478,15 @@ def on_connect():
             t.daemon = True
             t.start()
 
+    # Tell the new client whether a flight is already recording, so a page
+    # opened mid-flight can attach to the live track instead of waiting for
+    # the next 'flight_started'.
+    if tracker is not None:
+        try:
+            socketio.emit('tracker_status', tracker.status())
+        except Exception:
+            pass
+
 @socketio.on('disconnect')
 def on_disconnect():
     print("Client disconnected!")
@@ -1448,6 +1575,26 @@ if __name__ == '__main__':
     print("POST /queue/add      {action, params}   (not drained — no-op)")
     print("GET  /queue/status")
     print("POST /queue/clear")
+    print("")
+    if TRACKER_AVAILABLE:
+        print(f"Flight tracker ({TRACK_HZ:g} Hz, one flight per arm):")
+        print("GET  /flights              list past flights")
+        print("GET  /flights/current      live recording status")
+        print("GET  /flights/<id>         metadata + summary + events")
+        print("GET  /flights/<id>/track   ?fields=x_m,y_m,z_m&decimate=N")
+        print("GET  /flights/<id>/events  timeline markers")
+        print("GET  /flights/<id>/video   mp4, HTTP Range (seekable)")
+        print("POST /flights/<id>/label   {label, notes}")
+        print("POST /flights/<id>/mark    {detail}  marker on live timeline")
+        print("DEL  /flights/<id>         ?keep_video=1")
+        print("GET  /flights/stats")
+        print("POST /flights/sim/start    synthetic flight, no Pixhawk needed")
+        print("POST /flights/sim/stop")
+        print("  socket: flight_started / track_point / flight_ended")
+        print(f"  db:     {os.path.abspath(FLIGHTS_DB)}")
+        print(f"  video:  {os.path.abspath(FLIGHTS_VIDEO)}")
+    else:
+        print(f"Flight tracker DISABLED — {TRACKER_ERROR}")
     print("")
     print("GONE: /move, /yaw  -> 410, use /rc (GUIDED-mode, removed)")
     socketio.run(
