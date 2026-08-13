@@ -24,7 +24,7 @@ import threading
 import time
 from datetime import datetime
 
-from .sources import LiveSource, SimSource
+from .sources import LiveSource, NavSimSource, SimSource
 from .store import FlightStore
 
 SAMPLE_HZ = 5.0
@@ -126,23 +126,47 @@ class FlightTracker:
 
     # ── sim control ───────────────────────────────────────────────────
 
-    def start_sim(self, **kw):
+    def start_sim(self, profile="square", **kw):
         """
         Run a synthetic flight. Lets the whole UI be built and demoed with no
         Pixhawk attached — the DB rows, the socket events and the REST payloads
         are identical to a real flight.
+
+        profile="square" replays a fixed square and ends on its own.
+        profile="nav" instead hands control to WaypointNav, staying armed and
+        hovering until a waypoint arrives or stop_sim() is called. Use it to
+        exercise the navigation loop with no aircraft.
         """
         with self._lock:
             if self.flight_id is not None:
                 return {"success": False, "message": "a flight is already recording"}
-            sim = SimSource(**kw)
+            if profile == "nav":
+                sim = NavSimSource(**kw)
+            else:
+                sim = SimSource(**kw)
             sim.start()
             self._sim = sim
         # start() takes the same lock, and threading.Lock is not reentrant —
         # calling it inside the block above deadlocks the request thread.
         self.start()
-        return {"success": True, "message": "sim flight started",
-                "duration_s": round(sim.total_s, 1)}
+        return {"success": True, "message": f"sim flight started ({profile})",
+                "profile": profile,
+                "duration_s": round(getattr(sim, "total_s", 0.0), 1) or None}
+
+    def sim_source(self):
+        """The running sim, or None. Lets the server point nav at it."""
+        return self._sim
+
+    def origin(self):
+        """
+        The arm-point NED reading this flight's track is measured from, as
+        (north, east, down), or (None, None, None) when nothing is recording.
+
+        Anything that wants to talk about position in the same frame the browser
+        plot draws — waypoint navigation, above all — has to subtract this. It
+        is exposed rather than recomputed so there is exactly one definition.
+        """
+        return self._origin
 
     def stop_sim(self):
         if self._sim:
@@ -239,7 +263,11 @@ class FlightTracker:
                 if self._hub is not None and not self._hub.running:
                     self._hub.start()
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                vpath = self._video.start(f"flight_{fid:05d}_{stamp}")
+                # Frames the hub buffered before the arm. Empty unless the
+                # camera was already running and preroll_s is non-zero, in
+                # which case the clip simply begins at the arm as it always did.
+                pre = self._hub.preroll() if self._hub is not None else []
+                vpath = self._video.start(f"flight_{fid:05d}_{stamp}", preroll=pre)
             except Exception as e:
                 print(f"[tracker] video start failed: {type(e).__name__}: {e}")
 

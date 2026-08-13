@@ -70,7 +70,17 @@ class VideoRecorder:
 
     # ── control ───────────────────────────────────────────────────────
 
-    def start(self, basename):
+    def start(self, basename, preroll=None):
+        """
+        preroll: [(frame, stamp)] from FrameHub.preroll(), oldest first.
+
+        Written ahead of the live stream so the clip opens before the arm. It
+        also drags started_at BACKWARDS to the first buffered frame, which is
+        what keeps the video aligned with the track: the recorder computes
+        video_start_offset_ms as (started_at - flight_t0), so a pre-roll simply
+        makes that offset negative and the existing player maths
+        ((t_ms - offset) / 1000) still lands on the right frame.
+        """
         with self._lock:
             if self.active:
                 return None
@@ -85,7 +95,7 @@ class VideoRecorder:
             self.path = os.path.join(self.out_dir, basename + ext)
 
             self._thread = threading.Thread(
-                target=self._run, args=(use_ff,), daemon=True,
+                target=self._run, args=(use_ff, list(preroll or [])), daemon=True,
                 name="video-recorder")
             self._thread.start()
             return self.path
@@ -153,7 +163,7 @@ class VideoRecorder:
             w.release()
         raise RuntimeError("no usable cv2 encoder")
 
-    def _run(self, use_ffmpeg):
+    def _run(self, use_ffmpeg, preroll=()):
         proc = writer = None
         try:
             if use_ffmpeg:
@@ -172,6 +182,35 @@ class VideoRecorder:
                 self.error = f"{self.error}; fallback: {e2}"
                 return
 
+        def _emit(frame):
+            """Resize if needed and write one frame. Returns False on failure."""
+            out = frame
+            if cv2 is not None and (out.shape[1] != self.width or
+                                    out.shape[0] != self.height):
+                out = cv2.resize(out, (self.width, self.height))
+            try:
+                if proc is not None:
+                    proc.stdin.write(out.tobytes())
+                else:
+                    writer.write(out)
+                self.frames += 1
+                return True
+            except Exception as e:
+                self.error = f"write failed: {type(e).__name__}: {e}"
+                print(f"[video] {self.error}")
+                return False
+
+        # Pre-arm frames first, as fast as the encoder takes them — they are
+        # already timestamped in the past, so pacing them at fps would just
+        # delay the live stream by the length of the buffer.
+        if preroll:
+            self.started_at = preroll[0][1]
+            for frame, _stamp in preroll:
+                if self._stop.is_set() or not _emit(frame):
+                    break
+            print(f"[video] pre-roll: {len(preroll)} frames "
+                  f"({len(preroll) / max(1.0, float(self.fps)):.1f}s before arm)")
+
         period = 1.0 / self.fps
         last_seq = 0
         last_frame = None
@@ -184,21 +223,9 @@ class VideoRecorder:
                 last_frame = frame
 
             if last_frame is not None:
-                out = last_frame
-                if cv2 is not None and (out.shape[1] != self.width or
-                                        out.shape[0] != self.height):
-                    out = cv2.resize(out, (self.width, self.height))
-                try:
-                    if proc is not None:
-                        proc.stdin.write(out.tobytes())
-                    else:
-                        writer.write(out)
-                    if self.started_at is None:
-                        self.started_at = time.time()
-                    self.frames += 1
-                except Exception as e:
-                    self.error = f"write failed: {type(e).__name__}: {e}"
-                    print(f"[video] {self.error}")
+                if self.started_at is None:
+                    self.started_at = time.time()
+                if not _emit(last_frame):
                     break
 
             next_t += period

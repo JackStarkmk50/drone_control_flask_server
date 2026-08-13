@@ -20,11 +20,11 @@ Server wiring (see README.md for the full diff):
 
 from .frames import FrameHub
 from .recorder import FlightTracker, SAMPLE_HZ
-from .sources import LiveSource, SimSource
+from .sources import LiveSource, NavSimSource, SimSource
 from .store import FlightStore, SCHEMA_VERSION
 
 __all__ = [
     "FlightTracker", "FrameHub", "FlightStore",
-    "LiveSource", "SimSource",
+    "LiveSource", "SimSource", "NavSimSource",
     "SAMPLE_HZ", "SCHEMA_VERSION",
 ]

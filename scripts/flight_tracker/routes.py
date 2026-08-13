@@ -190,15 +190,25 @@ def make_blueprint(tracker):
         be built and demoed without waiting for space to fly.
         """
         d = request.get_json(silent=True) or {}
+        profile = str(d.get("profile", "square")).lower()
+        if profile not in ("square", "nav"):
+            return err("profile must be 'square' or 'nav'")
+
+        # The two profiles take different kwargs; handing the nav sim a square's
+        # `side` would be a TypeError, so each gets its own whitelist.
+        allowed = (("alt", float), ("battery_v", float), ("yaw_deg", float)) \
+            if profile == "nav" else \
+            (("alt", float), ("side", float), ("speed", float),
+             ("hover_s", float), ("battery_v", float))
+
         kw = {}
-        for k, cast in (("alt", float), ("side", float), ("speed", float),
-                        ("hover_s", float), ("battery_v", float)):
+        for k, cast in allowed:
             if k in d:
                 try:
                     kw[k] = cast(d[k])
                 except (TypeError, ValueError):
                     return err(f"bad value for {k}")
-        res = tracker.start_sim(**kw)
+        res = tracker.start_sim(profile=profile, **kw)
         return (ok(**res) if res.get("success")
                 else (jsonify(res), 409))
 

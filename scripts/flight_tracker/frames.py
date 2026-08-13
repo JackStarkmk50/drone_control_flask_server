@@ -13,16 +13,28 @@ grabber, which is the correct behaviour for both a live view and a fixed-rate
 recording.
 """
 
+import collections
 import threading
 import time
 
 
 class FrameHub:
 
-    def __init__(self, read_fn, fps=10, name="framehub"):
+    def __init__(self, read_fn, fps=10, name="framehub", preroll_s=0.0):
         """
         read_fn: callable returning (ok, frame). Supplied by the server so the
                  hub does not need to know how the capture is locked or opened.
+
+        preroll_s: seconds of recent frames to keep so a flight video can begin
+                 BEFORE the arm. The interesting part of an indoor flight is
+                 usually the moment of takeoff, and recording that only from the
+                 armed edge misses the run-up every time.
+
+                 Costs RAM, and the cost is not trivial: a 640x480 BGR frame is
+                 ~0.9 MB, so 3 s at 10 fps holds ~27 MB resident for as long as
+                 the camera is running. That is fine on a Pi 5 and noticeable on
+                 a Pi 2 with 1 GB, which is why it is a parameter and why 0
+                 (disabled) is the default here — the server chooses.
         """
         self._read = read_fn
         self._period = 1.0 / max(1, fps)
@@ -32,6 +44,11 @@ class FrameHub:
         self._frame = None
         self._seq = 0
         self._stamp = 0.0
+
+        # maxlen=0 makes append a no-op, so preroll_s=0 costs nothing and needs
+        # no branch in the grab loop.
+        self._ring = collections.deque(maxlen=max(0, int(round(preroll_s * max(1, fps)))))
+        self.preroll_s = float(preroll_s)
 
         self._running = False
         self._thread = None
@@ -73,6 +90,9 @@ class FrameHub:
                     self._frame = frame
                     self._seq += 1
                     self._stamp = t0
+                    # cv2 hands back a fresh array each read, so holding the
+                    # reference cannot alias the next frame.
+                    self._ring.append((frame, t0))
                     self._lock.notify_all()
             else:
                 misses += 1
@@ -95,6 +115,18 @@ class FrameHub:
         """(seq, frame, stamp) without waiting. seq==0 means nothing grabbed yet."""
         with self._lock:
             return self._seq, self._frame, self._stamp
+
+    def preroll(self):
+        """
+        The buffered pre-arm frames, oldest first, as [(frame, stamp)].
+
+        A snapshot: the caller gets a plain list and the ring keeps filling, so
+        a slow consumer cannot stall the grabber. Empty when preroll is disabled
+        or the camera only just started — both are normal, and the recorder
+        simply begins at the arm as it always did.
+        """
+        with self._lock:
+            return list(self._ring)
 
     def wait_for_new(self, last_seq, timeout=2.0):
         """

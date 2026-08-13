@@ -197,6 +197,200 @@ class LiveSource:
         return s
 
 
+class NavSimSource:
+    """
+    A simulated aircraft that is *flown by the real controller*.
+
+    SimSource replays a fixed square, which is enough to build a replay UI
+    against but proves nothing about navigation. This one instead accepts the
+    same RC PWM values WaypointNav sends to the real aircraft, decodes them back
+    into a velocity demand exactly the way ArduCopter's LOITER does, and
+    integrates. The whole outer loop — position error, speed cap, slew limit,
+    world-to-body rotation, PWM scaling — runs unmodified.
+
+    That round trip through PWM is the point. A sign error in the body-frame
+    rotation, or a mismatch with DIR_MAP's forward-is-below-neutral convention,
+    makes the simulated aircraft accelerate away from the waypoint. That shows
+    up in a browser on a laptop rather than in a wall.
+
+    Modelled deliberately, because each part can hide a different bug:
+
+      * LOITER's velocity loop as a first-order lag (VEL_TAU_S). The outer P
+        loop has to stay stable on top of a lagging inner loop; an instant
+        response would hide overshoot the real aircraft will have.
+      * A settable heading. At yaw=0 a pure north command is pure pitch and a
+        rotation error is invisible. Fly the same waypoint at yaw=90 degrees and
+        it becomes pure roll, so the rotation is actually under test.
+      * Stays armed until stop(), unlike SimSource's fixed profile, because
+        navigation is open-ended.
+    """
+
+    name = "navsim"
+
+    CLIMB_RATE = 0.5     # m/s, used only for the initial climb to hover
+    ARM_PAUSE_S = 1.0
+    VEL_TAU_S = 0.5      # first-order lag standing in for LOITER's velocity loop
+
+    def __init__(self, alt=1.5, yaw_deg=0.0, battery_v=16.4,
+                 pwm_per_ms=100.0, pwm_per_ms_z=200.0):
+        self.alt_target = float(alt)
+        self.yaw = math.radians(float(yaw_deg))
+        self.batt0 = float(battery_v)
+        self.pwm_per_ms = float(pwm_per_ms)
+        self.pwm_per_ms_z = float(pwm_per_ms_z)
+
+        self._t0 = None
+        self._last = None
+        self._armed = False
+        self._done = False
+
+        # State: position in NED-ish terms plus an up-positive altitude, and the
+        # velocity actually achieved (as opposed to demanded).
+        self._n = 0.0
+        self._e = 0.0
+        self._alt = 0.0
+        self._vn = 0.0
+        self._ve = 0.0
+        self._vd = 0.0
+
+        self._rc = {"roll": 1500, "pitch": 1500, "throttle": 1500, "yaw": 1500}
+
+    # ── lifecycle ────────────────────────────────────────────────
+
+    def start(self):
+        self._t0 = time.time()
+        self._last = self._t0
+        self._armed = True
+        self._done = False
+
+    def stop(self):
+        self._armed = False
+        self._done = True
+
+    def is_armed(self):
+        return self._armed
+
+    def is_done(self):
+        return self._done
+
+    def reset(self):
+        pass
+
+    # ── the interface WaypointNav drives ─────────────────────────
+
+    def apply_rc(self, roll, pitch, throttle, yaw):
+        """Stands in for MovementController.set_rc()."""
+        self._rc = {"roll": int(roll), "pitch": int(pitch),
+                    "throttle": int(throttle), "yaw": int(yaw)}
+
+    def pose(self):
+        """
+        Stands in for the server's pose_fn: origin-relative, x east, y north,
+        z up. The simulated aircraft starts at its own origin, so no subtraction
+        is needed here.
+        """
+        self._integrate()
+        return {
+            "x": self._e, "y": self._n, "z": self._alt,
+            "yaw": self.yaw, "src": "ekf", "ekf_ok": True,
+            "armed": self._armed, "mode": self._mode(), "t": time.time(),
+        }
+
+    def _mode(self):
+        if self._t0 is None:
+            return "STABILIZE"
+        return "LOITER" if (time.time() - self._t0) >= self.ARM_PAUSE_S else "STABILIZE"
+
+    # ── physics ──────────────────────────────────────────────────
+
+    def _integrate(self):
+        if self._t0 is None or not self._armed:
+            return
+        now = time.time()
+        dt = now - (self._last or now)
+        self._last = now
+        if dt <= 0 or dt > 1.0:      # first call, or the thread was descheduled
+            return
+
+        t = now - self._t0
+
+        # Climb to the hover altitude before accepting stick input, the same way
+        # a real flight reaches altitude before anyone clicks a waypoint.
+        if self._alt < self.alt_target - 0.02 and t > self.ARM_PAUSE_S:
+            self._alt = min(self.alt_target, self._alt + self.CLIMB_RATE * dt)
+            self._vd = -self.CLIMB_RATE
+            return
+
+        # Decode PWM back to a body-frame velocity demand. Exact inverse of
+        # WaypointNav._control: forward is BELOW neutral on pitch, right is
+        # ABOVE neutral on roll.
+        d_roll = self._rc["roll"] - 1500
+        d_pitch = self._rc["pitch"] - 1500
+        d_thr = self._rc["throttle"] - 1500
+
+        right = d_roll / self.pwm_per_ms
+        fwd = -d_pitch / self.pwm_per_ms
+
+        # Body -> world. Transpose of the rotation the controller applied.
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        want_n = fwd * cy - right * sy
+        want_e = fwd * sy + right * cy
+        want_up = d_thr / self.pwm_per_ms_z
+
+        # First-order lag towards the demand.
+        k = min(1.0, dt / self.VEL_TAU_S)
+        self._vn += (want_n - self._vn) * k
+        self._ve += (want_e - self._ve) * k
+        vup = -self._vd
+        vup += (want_up - vup) * k
+        self._vd = -vup
+
+        self._n += self._vn * dt
+        self._e += self._ve * dt
+        self._alt = max(0.0, self._alt + vup * dt)
+
+    # ── the interface the recorder drives ────────────────────────
+
+    def sample(self):
+        s = dict.fromkeys(SAMPLE_KEYS)
+        if self._t0 is None:
+            return s
+        self._integrate()
+
+        t = time.time() - self._t0
+        wob = 0.015 * math.sin(t * 2.3)
+        span = max(t, 1.0)
+
+        s.update({
+            "north": round(self._n, 4),
+            "east": round(self._e, 4),
+            "down": round(-self._alt, 4),
+            "pos_source": "ekf",
+            "alt_rf_m": round(max(0.0, self._alt), 3),
+            "alt_rel_m": round(max(0.0, self._alt), 3),
+            "roll": round(self._ve * 0.08 + wob, 5),
+            "pitch": round(-self._vn * 0.08 + wob, 5),
+            "yaw": round(self.yaw, 5),
+            "vx": round(self._vn, 3), "vy": round(self._ve, 3),
+            "vz": round(self._vd, 3),
+            "groundspeed": round(math.hypot(self._vn, self._ve), 3),
+            "rc_roll": self._rc["roll"], "rc_pitch": self._rc["pitch"],
+            "rc_throttle": self._rc["throttle"], "rc_yaw": self._rc["yaw"],
+            "corr_roll": int(-wob * 300), "corr_pitch": int(-wob * 300),
+            "mode": self._mode(),
+            "armed": 1 if self._armed else 0,
+            "battery_v": round(self.batt0 - 0.004 * span, 2),
+            "battery_pct": round(max(0.0, 100 - 0.25 * span), 1),
+            "battery_current": round(18.0 + 4 * abs(self._vd), 2),
+            "ekf_ok": 1,
+            "vibe_x": round(12 + 3 * abs(self._vn), 2),
+            "vibe_y": round(12 + 3 * abs(self._ve), 2),
+            "vibe_z": round(18 + 5 * abs(self._vd), 2),
+            "sats": 0, "gps_fix": 0,
+        })
+        return s
+
+
 class SimSource:
     """
     Synthetic flight, no vehicle required.

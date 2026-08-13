@@ -45,6 +45,19 @@ except Exception as _e:
     TRACKER_AVAILABLE = False
     TRACKER_ERROR = f"{type(_e).__name__}: {_e}"
 
+# Click-to-waypoint navigation, optional on the same principle.
+try:
+    from waypoint_nav import (WaypointNav, make_nav_bp, NAV_DEADMAN_S,
+                              MAX_RADIUS_M as NAV_MAX_RADIUS)
+    NAV_AVAILABLE = True
+    NAV_ERROR = None
+except Exception as _e:
+    WaypointNav = None
+    NAV_DEADMAN_S = 0.3
+    NAV_MAX_RADIUS = 0.0
+    NAV_AVAILABLE = False
+    NAV_ERROR = f"{type(_e).__name__}: {_e}"
+
 def scan_networks():
     print("Triggering Wi-Fi environment rescan...")
     subprocess.run(
@@ -195,6 +208,21 @@ camera_active      = False
 CAMERA_FPS         = 10
 CAMERA_JPEG_QUALITY = 70   # 70% quality: fine for live stream, ~40% smaller than default
 
+# Seconds of frames kept in memory so a flight video can start BEFORE the arm.
+# The interesting part of an indoor flight is usually the takeoff, and recording
+# only from the armed edge misses the run-up every time.
+#
+# Costs RAM: a 640x480 BGR frame is ~0.9 MB, so 3 s at 10 fps holds ~27 MB
+# resident while the camera runs. Fine on a Pi 5; noticeable on a Pi 2's 1 GB.
+# Set to 0 to disable.
+CAMERA_PREROLL_S   = 3.0
+
+# Start grabbing as soon as the server does, rather than waiting for the first
+# viewer. Two reasons: the pre-roll buffer is only useful if the camera was
+# already running when the aircraft armed, and the live stream then has frames
+# to serve immediately instead of paying the ~1 s V4L2 settle on first request.
+CAMERA_AUTOSTART   = True
+
 # Exactly one thread may call camera.read() — read() CONSUMES a frame, so two
 # readers split the stream between them and both run at half rate. The hub owns
 # that single read and hands the latest frame to every consumer (the MJPEG
@@ -207,7 +235,8 @@ def _hub_read():
     return cap.read()
 
 
-frame_hub = FrameHub(_hub_read, fps=CAMERA_FPS) if TRACKER_AVAILABLE else None
+frame_hub = (FrameHub(_hub_read, fps=CAMERA_FPS, preroll_s=CAMERA_PREROLL_S)
+             if TRACKER_AVAILABLE else None)
 
 # ─── Flight Tracker Paths ────────────────
 # scripts/../flights/  →  /home/pi/drone/flights/
@@ -265,6 +294,25 @@ if TRACKER_AVAILABLE:
         print(f"[tracker] DISABLED — {TRACKER_ERROR}")
 else:
     print(f"[tracker] DISABLED — {TRACKER_ERROR}")
+
+# ─── Waypoint Navigation ─────────────────
+# Unlike the tracker, this one WRITES to the aircraft — it is a closed position
+# loop that drives the RC override stream. Every safety gate lives inside
+# WaypointNav; the server's job is to hand it a pose, a way to send sticks, and
+# to abort it whenever anything else takes control (see _nav_abort callers).
+nav = None
+if NAV_AVAILABLE:
+    try:
+        nav = WaypointNav(socketio=socketio, mode="rc")
+        app.register_blueprint(make_nav_bp(nav), url_prefix="/nav")
+        print("[nav] blueprint registered at /nav")
+    except Exception as _e:
+        nav = None
+        NAV_AVAILABLE = False
+        NAV_ERROR = f"{type(_e).__name__}: {_e}"
+        print(f"[nav] DISABLED — {NAV_ERROR}")
+else:
+    print(f"[nav] DISABLED — {NAV_ERROR}")
 
 # ─── Global State ────────────────────────
 vehicle = None
@@ -467,6 +515,109 @@ def _configure_streams(veh):
     print(f"[stream] configured @{SERIAL_BAUD} baud — "
           f"ATTITUDE {ATTITUDE_RATE_HZ}Hz, EXTRA3 {EXTRA3_RATE_HZ}Hz "
           f"(correction loop {CORR_RATE_HZ}Hz, RC out {RC_RATE_HZ}Hz)")
+
+
+# ─── Waypoint Navigation Bridge ──────────
+# WaypointNav holds no reference to the vehicle or the MovementController. It
+# reads pose through one callable and writes sticks through another, which is
+# what lets the identical control law be flown against the simulator in a
+# browser with no Pixhawk attached.
+
+def _nav_pose():
+    """
+    Current pose in the SAME frame the browser plot is drawn in: metres east,
+    north and up of the arm point.
+
+    Returns None when there is no usable reference frame — no aircraft, or no
+    flight recording, which means no arm-point origin to measure from. Nav
+    treats that as "cannot navigate" rather than guessing an origin, because a
+    guessed origin puts every waypoint in the wrong place.
+    """
+    sim = tracker.sim_source() if tracker is not None else None
+    if sim is not None and hasattr(sim, "pose"):
+        return sim.pose()
+
+    v = vehicle
+    if v is None:
+        return None
+
+    origin = tracker.origin() if tracker is not None else (None, None, None)
+    if origin[0] is None or origin[1] is None:
+        return None
+
+    try:
+        lf = v.location.local_frame
+    except Exception:
+        lf = None
+    if lf is None or lf.north is None or lf.east is None:
+        return None
+
+    down = lf.down if lf.down is not None else 0.0
+    o_down = origin[2] if origin[2] is not None else 0.0
+
+    def _get(fn, default=None):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    return {
+        "x": lf.east - origin[1],          # metres east of the arm point
+        "y": lf.north - origin[0],         # metres north
+        "z": -(down - o_down),             # metres up (NED down, flipped)
+        "yaw": _get(lambda: v.attitude.yaw, 0.0),
+        # LiveSource labels a sample "ekf" only when local_frame answered; this
+        # path only exists because it did, so the label matches. If the EKF drops
+        # out mid-flight local_frame goes None and this returns None above,
+        # which aborts the leg rather than steering on stale numbers.
+        "src": "ekf",
+        "ekf_ok": bool(_get(lambda: v.ekf_ok, False)),
+        "armed": bool(_get(lambda: v.armed, False)),
+        "mode": _get(lambda: v.mode.name, None),
+        "t": time.time(),
+    }
+
+
+def _nav_send(roll, pitch, throttle, yaw):
+    """Apply stick values, and refresh the deadman so it does not centre them."""
+    sim = tracker.sim_source() if tracker is not None else None
+    if sim is not None and hasattr(sim, "apply_rc"):
+        sim.apply_rc(roll, pitch, throttle, yaw)
+        return
+    if mc is None:
+        raise RuntimeError("movement controller not initialised")
+    mc.set_rc(roll=roll, pitch=pitch, throttle=throttle, yaw=yaw)
+    mc.touch_deadman(NAV_DEADMAN_S)
+
+
+def _nav_param(name):
+    v = vehicle
+    if v is None:
+        return None
+    try:
+        return v.parameters.get(name)
+    except Exception:
+        return None
+
+
+def _nav_abort(reason):
+    """
+    Stop navigating. Called from every path that takes control away from nav —
+    a manual stick command, hold, land, RTL, emergency, disarm, mode change.
+
+    Silent no-op when nav is unavailable or idle, so callers do not have to
+    guard, and wrapped so a nav fault can never break a flight command's
+    response path.
+    """
+    if nav is None:
+        return
+    try:
+        nav.abort(reason)
+    except Exception as e:
+        print(f"[nav] abort failed: {type(e).__name__}: {e}")
+
+
+# nav.attach() happens further down, once _mark is defined.
 
 
 # ─── Connect Drone ───────────────────────
@@ -768,6 +919,16 @@ def _mark(kind, detail=None):
     except Exception:
         pass
 
+
+# Deferred until here because attach() captures _mark, which is defined just
+# above. The loop is started now rather than in connect_drone() so waypoint
+# navigation can be flown against the simulator with no Pixhawk attached.
+if nav is not None:
+    nav.attach(pose_fn=_nav_pose, send_fn=_nav_send,
+               mark_fn=_mark, param_fn=_nav_param)
+    nav.start()
+
+
 # ─── Routes ──────────────────────────────
 
 @app.route('/')
@@ -801,6 +962,7 @@ def health():
             "gps_fix":       safe_int(vehicle.gps_0.fix_type) if vehicle.gps_0 else 0,
             "system_status": sys_status,
             "tracker":       tracker.status() if tracker else {"available": False},
+            "nav":           nav.status() if nav else {"available": False, "error": NAV_ERROR},
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -867,6 +1029,7 @@ def disarm():
         if not vehicle.armed:
             return jsonify({"success": False, "message": "Already disarmed"})
 
+        _nav_abort("disarm")
         rf = safe_float(vehicle.rangefinder.distance)
         if rf <= 0:
             return jsonify({
@@ -951,6 +1114,7 @@ def takeoff():
             _cmd_lock.release()
             return jsonify({"success": False, "message": "Min altitude is 0.5m"}), 400
 
+        _nav_abort("takeoff")
         _mark("takeoff", f"target {altitude}m")
 
         def _takeoff_worker():
@@ -979,6 +1143,7 @@ def land():
         return _no_vehicle()
     try:
         _takeoff_cancelled = True
+        _nav_abort("land")
         vehicle.mode = VehicleMode("LAND")
         _mark("land")
         return jsonify({"success": True, "message": "Landing"})
@@ -995,6 +1160,7 @@ def rtl():
         if safe_int(vehicle.gps_0.fix_type) < 3:
             return jsonify({"success": False, "message": "No GPS fix for RTL"}), 400
         _takeoff_cancelled = True
+        _nav_abort("rtl")
         vehicle.mode = VehicleMode("RTL")
         _mark("rtl")
         return jsonify({"success": True, "message": "Returning to launch"})
@@ -1033,6 +1199,7 @@ def set_mode():
         if mode not in allowed_modes:
             return jsonify({"success": False, "message": f"Mode must be one of {allowed_modes}"}), 400
 
+        _nav_abort(f"mode change to {mode}")
         vehicle.mode = VehicleMode(mode)
         time.sleep(0.5)
         return jsonify({"success": True, "message": f"Mode changed to {mode}", "mode": mode})
@@ -1078,6 +1245,7 @@ def hold():
     try:
         _takeoff_cancelled = True
         _motion_cancelled  = True
+        _nav_abort("hold")
         res = mc.hold()
         if res["ok"]:
             return jsonify({"success": True, "message": res["message"]})
@@ -1094,6 +1262,7 @@ def emergency():
     try:
         _takeoff_cancelled = True
         _motion_cancelled  = True
+        _nav_abort("emergency")
         mc.emergency_stop()
         _mark("emergency")
         return jsonify({"success": True, "message": "Emergency stop executed"})
@@ -1113,6 +1282,7 @@ def mission_start():
         steps = data.get('steps', [])
         if not steps:
             return jsonify({"success": False, "message": "steps list required"}), 400
+        _nav_abort("mission started")
         mm.run_mission(steps, blocking=False)
         _mark("mission", ",".join(str(s.get("cmd")) for s in steps))
         return jsonify({"success": True, "message": "Mission started", "steps": len(steps)})
@@ -1418,6 +1588,14 @@ def _rc_apply(data, deadman_s):
 
     action = data.get("action", "move")
 
+    # Manual input always wins. Without this the operator's stick command and
+    # the nav loop would both write the same four channels ten times a second
+    # and the aircraft would follow whichever wrote last — which is neither.
+    # Abort first, then apply, so nav cannot overwrite the command that just
+    # took control away from it.
+    if action in ("move", "hold"):
+        _nav_abort("manual RC input")
+
     if action == "start":
         mc.start_rc_override()
         return {"success": True, "message": "RC started"}, 200
@@ -1484,6 +1662,14 @@ def on_connect():
     if tracker is not None:
         try:
             socketio.emit('tracker_status', tracker.status())
+        except Exception:
+            pass
+
+    # Same reasoning for navigation: a page opened while the aircraft is already
+    # flying a waypoint needs to render the pending route, not an empty panel.
+    if nav is not None:
+        try:
+            socketio.emit('nav_status', nav.status())
         except Exception:
             pass
 
@@ -1588,7 +1774,7 @@ if __name__ == '__main__':
         print("POST /flights/<id>/mark    {detail}  marker on live timeline")
         print("DEL  /flights/<id>         ?keep_video=1")
         print("GET  /flights/stats")
-        print("POST /flights/sim/start    synthetic flight, no Pixhawk needed")
+        print("POST /flights/sim/start    {profile:'square'|'nav'} no Pixhawk needed")
         print("POST /flights/sim/stop")
         print("  socket: flight_started / track_point / flight_ended")
         print(f"  db:     {os.path.abspath(FLIGHTS_DB)}")
@@ -1596,7 +1782,35 @@ if __name__ == '__main__':
     else:
         print(f"Flight tracker DISABLED — {TRACKER_ERROR}")
     print("")
+    if nav is not None:
+        print("Click-to-waypoint navigation:")
+        print("POST /nav/goto    {x, y, z?, replace?}  metres east/north/up of arm point")
+        print("POST /nav/queue   {points:[{x,y,z?}, ...]}")
+        print("GET  /nav/status")
+        print("POST /nav/abort   {reason?}")
+        print("POST /nav/clear")
+        print("  socket: nav_status / nav_reached / nav_aborted")
+        print(f"  limits: {NAV_MAX_RADIUS:.0f}m radius, LOITER + EKF fix required")
+        print("  aborts on: manual RC, hold, land, rtl, mode change, disarm, emergency")
+    else:
+        print(f"Waypoint navigation DISABLED — {NAV_ERROR}")
+    print("")
     print("GONE: /move, /yaw  -> 410, use /rc (GUIDED-mode, removed)")
+
+    # Start grabbing before serving. The pre-roll buffer only has anything in it
+    # if the camera was already running when the aircraft armed, so waiting for
+    # the first browser to open the stream would make pre-roll depend on someone
+    # happening to be watching.
+    if CAMERA_AUTOSTART:
+        try:
+            start_camera()
+            print(f"[camera] autostarted  {CAMERA_FPS} fps  "
+                  f"pre-roll {CAMERA_PREROLL_S:g}s "
+                  f"({int(CAMERA_PREROLL_S * CAMERA_FPS)} frames buffered)")
+        except Exception as e:
+            # Not fatal: no camera must never stop the flight server starting.
+            print(f"[camera] autostart failed — {type(e).__name__}: {e}")
+
     socketio.run(
         app,
         host='0.0.0.0',
