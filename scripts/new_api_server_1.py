@@ -15,7 +15,7 @@ import cv2
 import subprocess
 # WebRTC is optional: import failure must not take the whole server down.
 # This was `from scripts.webrtc.routes import bp` — but the service runs
-# `python3 /home/pi/drone/scripts/new_api_server_1.py`, so sys.path[0] is the
+# `python3 /home/virtua/drone/scripts/new_api_server_1.py`, so sys.path[0] is the
 # scripts/ directory itself and there is no importable `scripts` package.
 # `webrtc` is the correct top-level name from there. aiortc is also missing
 # from requirements.txt, so a clean venv fails on that instead.
@@ -227,19 +227,48 @@ CAMERA_AUTOSTART   = True
 # readers split the stream between them and both run at half rate. The hub owns
 # that single read and hands the latest frame to every consumer (the MJPEG
 # generator, the flight video recorder, and any additional stream viewers).
+# Bound on the drain below. Never spin more than this many grabs in one cycle,
+# and treat a grab slower than this as one that waited on the sensor.
+DRAIN_MAX     = 8
+DRAIN_FRESH_S = 0.005
+
 def _hub_read():
     with camera_lock:
         cap = camera
     if cap is None:
         return False, None
-    return cap.read()
+
+    # Drain the V4L2 queue, then decode exactly one frame.
+    #
+    # This is the streaming delay. The kernel keeps several buffers per device,
+    # and a UVC webcam almost always ignores CAP_PROP_FPS -- it pushes its
+    # native ~30 fps into that queue while this loop consumes CAMERA_FPS (10).
+    # The queue is therefore permanently full, so read() returns whatever
+    # reached the front, which is several frames old, and the lag never
+    # recovers because the producer keeps outrunning the consumer.
+    #
+    # grab() dequeues a buffer WITHOUT decoding it, so it is cheap; retrieve()
+    # does the MJPEG->BGR work. A grab that returns instantly came off the
+    # backlog; a grab that blocks waited on the sensor and is therefore live.
+    # Grab until one blocks, then decode only that frame: newest frame, and
+    # still one decode per cycle, which is what a Pi 2 can afford.
+    #
+    # Costs nothing when the camera really is at CAMERA_FPS: the first grab
+    # blocks and the loop breaks immediately.
+    for _ in range(DRAIN_MAX):
+        t0 = time.time()
+        if not cap.grab():
+            return False, None
+        if time.time() - t0 > DRAIN_FRESH_S:
+            break
+    return cap.retrieve()
 
 
 frame_hub = (FrameHub(_hub_read, fps=CAMERA_FPS, preroll_s=CAMERA_PREROLL_S)
              if TRACKER_AVAILABLE else None)
 
 # ─── Flight Tracker Paths ────────────────
-# scripts/../flights/  →  /home/pi/drone/flights/
+# scripts/../flights/  →  /home/virtua/drone/flights/
 FLIGHTS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'flights')
 FLIGHTS_DB    = os.path.join(FLIGHTS_DIR, 'flights.db')
 FLIGHTS_VIDEO = os.path.join(FLIGHTS_DIR, 'video')
@@ -788,17 +817,36 @@ def stream_telemetry():
 def start_camera():
     global camera, camera_active
 
-    print("camera started")
+    # A handle we are about to throw away, released outside the lock.
+    stale = None
 
-    # Early exit if already running (checked outside lock for speed)
     with camera_lock:
         if camera is not None:
-            return
+            # Open already -- but if the grabber died (20 consecutive read
+            # failures, which is what a USB re-enumeration looks like) then the
+            # handle is stale and every consumer is starved behind it. Drop it
+            # and fall through to reopen. Without this, returning early here is
+            # why only a process restart brought the camera back.
+            if frame_hub is not None and not frame_hub.running:
+                print("[camera] grabber is dead, reopening the device")
+                stale         = camera
+                camera        = None
+                camera_active = False
+            else:
+                return
+
+    if stale is not None:
+        stale.release()
 
     print("Video Capture is starting")
 
     # Open and configure outside lock so 1s settle sleep doesn't block other threads
     cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
+    # Ask the driver for the shallowest queue it will give us, so a consumer
+    # slower than the sensor falls behind by as little as possible. The V4L2
+    # backend honours this on some drivers and silently ignores it on others,
+    # which is why _hub_read() drains as well.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -822,7 +870,13 @@ def start_camera():
                     print("[framehub] grabber started")
             else:
                 cap.release()
-                print("Failed to start camera")
+                # Raise, do not just log. Returning quietly here let
+                # /camera/start answer 200 "Camera started" with no camera, and
+                # the UI then opened a stream that ended immediately -- which
+                # fires <img> onerror and makes it call /camera/stop. That is
+                # the start-then-instant-stop.
+                raise RuntimeError("failed to open /dev/video0 "
+                                   "(device missing, busy, or no permission)")
 
 def stop_camera():
     global camera, camera_active
@@ -845,8 +899,10 @@ def stop_camera():
     return True
 
 def generate_frames():
+    # The route opens the device. Flask does not touch a generator until it
+    # starts writing the body, so anything raised in here lands AFTER the 200
+    # header has gone out and the browser only sees a stream that ended.
     print("[Cam] Generator Started")
-    start_camera()
 
     error_count = 0
     max_errors  = 10  # stop stream after 10 consecutive read failures
@@ -1304,6 +1360,13 @@ def mission_cancel():
 
 @app.route('/camera/stream', methods=['GET'])
 def video_feed():
+    try:
+        start_camera()
+    except Exception as e:
+        # 503 with a body the UI can show, instead of an empty 200 that looks
+        # to <img> like a broken image.
+        return jsonify({"success": False,
+                        "message": f"Camera unavailable: {e}"}), 503
     return Response(
         generate_frames(),
         mimetype='multipart/x-mixed-replace; boundary=frame'

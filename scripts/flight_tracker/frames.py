@@ -52,32 +52,59 @@ class FrameHub:
 
         self._running = False
         self._thread = None
+        # Generation counter. stop() joins, but a loop that exits on its own
+        # (20 read failures) must not clear _running for a grabber that started
+        # after it.
+        self._gen = 0
         self._consumers = 0
         self.errors = 0
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
     def start(self):
+        """Idempotent. Safe immediately after stop(), which joins."""
         with self._lock:
             if self._running:
                 return
             self._running = True
-        self._thread = threading.Thread(target=self._grab_loop, daemon=True,
-                                        name=self._name)
+            self._gen += 1
+            gen = self._gen
+        self._thread = threading.Thread(target=self._grab_loop, args=(gen,),
+                                        daemon=True, name=self._name)
         self._thread.start()
 
-    def stop(self):
+    def stop(self, timeout=2.0):
+        """
+        Stop the grabber and WAIT for it to leave read().
+
+        The join is the point. Setting a flag and returning is not enough:
+
+          - A stop/start pair — which the web UI does on every camera toggle —
+            spawns a second grabber while the first is still blocked inside
+            read(). Both then consume the same capture, so every consumer sees
+            half the frames, and whichever loop exits first clears _running out
+            from under the other.
+          - The caller's next move after stop() is to release the cv2 capture,
+            which the grab thread is at that moment reading through.
+        """
         with self._lock:
+            if not self._running:
+                return
             self._running = False
             self._lock.notify_all()
+        t = self._thread
+        # Never join from inside the grab thread itself.
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout)
+        self._thread = None
 
     @property
     def running(self):
         return self._running
 
-    def _grab_loop(self):
+    def _grab_loop(self, gen=0):
         misses = 0
-        while self._running:
+        while self._running and self._gen == gen:
             t0 = time.time()
             try:
                 ok, frame = self._read()
@@ -106,7 +133,10 @@ class FrameHub:
                 time.sleep(slack)
 
         with self._lock:
-            self._running = False
+            # Only this generation may clear the flag. A newer grabber must not
+            # be switched off by an older one finishing late.
+            if self._gen == gen:
+                self._running = False
             self._lock.notify_all()
 
     # ── consumer API ──────────────────────────────────────────────────

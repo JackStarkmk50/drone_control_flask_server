@@ -11,7 +11,7 @@ Wants=NetworkManager.service
 
 [Service]
 Type=oneshot
-ExecStart=/home/pi/wifi_manager.sh
+ExecStart=/home/virtua/wifi_manager.sh
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal

@@ -1,6 +1,6 @@
 #!/bin/bash
 # wifi_manager.sh
-# Copy to: /home/pi/
+# Copy to: /home/virtua/
 # Runs on boot via wifi-manager.service
 # Tries known WiFi networks for 20s, then falls back to hotspot "DroneControl"
 #

@@ -14,10 +14,10 @@ After=wifi-manager.service network.target
 Wants=wifi-manager.service
 
 [Service]
-User=pi
-WorkingDirectory=/home/pi/drone
-Environment=PATH=/home/pi/drone/venv/bin
-ExecStart=/home/pi/drone/venv/bin/python3 /home/pi/drone/scripts/new_api_server_1.py
+User=virtua
+WorkingDirectory=/home/virtua/drone
+Environment=PATH=/home/virtua/drone/venv/bin
+ExecStart=/home/virtua/drone/venv/bin/python3 /home/virtua/drone/scripts/new_api_server_1.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
